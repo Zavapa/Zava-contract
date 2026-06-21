@@ -1,0 +1,14 @@
+/home/olowo/Desktop/my projects/Zavapa/contract/contracts/target/release/deps/serde-c4726242b672eebd.d: /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/target/release/build/serde-e7d6fd13a80c6c0a/out/private.rs
+
+/home/olowo/Desktop/my projects/Zavapa/contract/contracts/target/release/deps/libserde-c4726242b672eebd.rlib: /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/target/release/build/serde-e7d6fd13a80c6c0a/out/private.rs
+
+/home/olowo/Desktop/my projects/Zavapa/contract/contracts/target/release/deps/libserde-c4726242b672eebd.rmeta: /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/target/release/build/serde-e7d6fd13a80c6c0a/out/private.rs
+
+/home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/olowo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/target/release/build/serde-e7d6fd13a80c6c0a/out/private.rs:
+
+# env-dep:OUT_DIR=/home/olowo/Desktop/my projects/Zavapa/contract/contracts/target/release/build/serde-e7d6fd13a80c6c0a/out

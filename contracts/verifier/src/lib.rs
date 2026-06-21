@@ -1,9 +1,49 @@
 #![no_std]
 
+//! # Verifier / Credit Contract
+//!
+//! Business-logic layer that sits on top of the savings + groth16 contracts.
+//!
+//! Flow:
+//!   1. A wallet calls [`VerifierContract::verify_proof`] with a Noir-generated
+//!      Groth16 proof and the public inputs the proof was generated against.
+//!   2. The contract cross-checks the commitment root against the savings
+//!      contract (binding the proof to current on-chain state) and confirms
+//!      each nullifier in the proof was actually recorded by a prior deposit.
+//!   3. It delegates the cryptographic check to the groth16 contract.
+//!   4. On success, it records a `CreditRecord` for the calling wallet with
+//!      a 90-day expiry. Re-proving before expiry overwrites the record.
+//!
+//! There is no admin key, no upgrade path, and no mutable configuration —
+//! the savings and groth16 contract addresses are set exactly once at
+//! initialisation.
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    Address, Bytes, BytesN, Env, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype,
+    symbol_short, Address, Bytes, BytesN, Env, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Cross-contract interfaces
+// ---------------------------------------------------------------------------
+//
+// Declared inline so this contract does not pull the other contracts' WASM
+// exports into its own binary (which would cause duplicate-symbol linker
+// errors). Only primitive SDK types cross the boundary — the savings and
+// groth16 contracts are free to evolve their internal structs without
+// breaking this client.
+
+#[contractclient(name = "SavingsClient")]
+pub trait SavingsInterface {
+    fn get_merkle_root(env: Env) -> BytesN<32>;
+    fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool;
+}
+
+#[contractclient(name = "Groth16Client")]
+pub trait Groth16Interface {
+    fn verify(env: Env, proof: Bytes, public_inputs: Vec<BytesN<32>>) -> bool;
+    fn get_verification_key(env: Env) -> Bytes;
+}
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -11,7 +51,7 @@ use soroban_sdk::{
 
 /// Credit tier assigned after a successful ZK proof verification.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreditTier {
     /// 8 consecutive weeks proven.
     Medium,
@@ -23,15 +63,12 @@ pub enum CreditTier {
 
 /// On-chain credit record written after a valid proof.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreditRecord {
     pub wallet: Address,
     pub tier: CreditTier,
-    /// Ledger timestamp when the proof was verified.
     pub verified_at: u64,
-    /// Number of consecutive weeks claimed in the proof.
     pub consistency_weeks: u32,
-    /// Timestamp after which this credit signal is considered expired.
     pub expires_at: u64,
 }
 
@@ -39,34 +76,53 @@ pub struct CreditRecord {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PublicInputs {
-    /// Must match the current Merkle root stored in the savings contract.
+    /// Must match the current Merkle root in the savings contract.
     pub commitment_root: BytesN<32>,
     /// Minimum weekly savings threshold claimed (in stroops).
     pub min_weekly_amount: u64,
     /// Number of consecutive weeks claimed (8, 12, or 24).
     pub consistency_weeks: u32,
-    /// One nullifier per deposit period claimed — prevents reuse.
+    /// One nullifier per deposit period claimed.
     pub nullifiers: Vec<BytesN<32>>,
 }
 
 // ---------------------------------------------------------------------------
-// Storage keys
+// Storage
 // ---------------------------------------------------------------------------
 
 #[contracttype]
 pub enum DataKey {
-    /// Address of the savings contract (set during initialize).
     SavingsContractId,
-    /// CreditRecord keyed by wallet address.
+    Groth16ContractId,
     CreditRecord(Address),
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum VerifierError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidConsistencyWeeks = 3,
+    CommitmentRootMismatch = 4,
+    NullifierNotRecorded = 5,
+    NullifierCountMismatch = 6,
+    ProofInvalid = 7,
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Credit signals expire after 90 days (in seconds).
+/// Credit signals expire after 90 days.
 const CREDIT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// Persistent storage TTL extension (in ledgers) — ~30 days at 5s per ledger.
+const PERSISTENT_TTL_LEDGERS: u32 = 518_400;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -81,107 +137,122 @@ impl VerifierContract {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    /// Store the savings contract address so the verifier can cross-check
-    /// the Merkle root and nullifier state.
-    ///
-    /// Must be called once after deployment.
-    pub fn initialize(env: Env, savings_contract_id: Address) {
-        assert!(
-            !env.storage().persistent().has(&DataKey::SavingsContractId),
-            "already initialized"
-        );
+    /// Bind this contract to a specific savings + groth16 deployment.
+    /// Callable exactly once.
+    pub fn initialize(
+        env: Env,
+        savings_contract: Address,
+        groth16_contract: Address,
+    ) -> Result<(), VerifierError> {
+        if env.storage().instance().has(&DataKey::SavingsContractId) {
+            return Err(VerifierError::AlreadyInitialized);
+        }
         env.storage()
-            .persistent()
-            .set(&DataKey::SavingsContractId, &savings_contract_id);
+            .instance()
+            .set(&DataKey::SavingsContractId, &savings_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::Groth16ContractId, &groth16_contract);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Core verification
     // -----------------------------------------------------------------------
 
-    /// Verify a Noir-generated Groth16 ZK proof on-chain.
+    /// Verify a Noir-generated Groth16 proof and, on success, record a
+    /// credit tier for `wallet`.
     ///
-    /// On success: records a `CreditRecord` for the calling wallet and emits
-    /// a `CreditVerified` event.
-    ///
-    /// On failure: panics with a descriptive error string.
-    ///
-    /// # Arguments
-    /// * `proof`         — Raw Groth16 proof bytes produced by the Noir circuit.
-    /// * `public_inputs` — Public inputs the proof was generated against.
-    pub fn verify_proof(env: Env, proof: Bytes, public_inputs: PublicInputs) -> bool {
-        let caller = env.current_contract_address(); // placeholder — see note below
+    /// `wallet` must authorise the call — the credit record is keyed by it,
+    /// so the wallet that pays for verification earns the reputation.
+    pub fn verify_proof(
+        env: Env,
+        wallet: Address,
+        proof: Bytes,
+        public_inputs: PublicInputs,
+    ) -> Result<CreditTier, VerifierError> {
+        wallet.require_auth();
 
-        // --- 1. Validate consistency_weeks → credit tier ---
-        let tier = Self::weeks_to_tier(public_inputs.consistency_weeks);
+        let tier = Self::weeks_to_tier(public_inputs.consistency_weeks)?;
 
-        // --- 2. Cross-check Merkle root against savings contract ---
-        // In a real deployment this would be a cross-contract call:
-        //   let savings_id: Address = env.storage()...get(&DataKey::SavingsContractId)...
-        //   let savings_client = SavingsContractClient::new(&env, &savings_id);
-        //   let on_chain_root = savings_client.get_merkle_root();
-        //   assert!(public_inputs.commitment_root == on_chain_root, "CommitmentRootMismatch");
-        //
-        // Stubbed here so the scaffold compiles without a live network:
-        let _ = public_inputs.commitment_root.clone(); // root check placeholder
-
-        // --- 3. Check nullifiers are unspent ---
-        // In production this calls savings_client.is_nullifier_spent(n) for each nullifier.
-        // Stubbed here — replace with real cross-contract calls.
-        for _i in 0..public_inputs.nullifiers.len() {
-            // assert!(!savings_client.is_nullifier_spent(&nullifier), "NullifierAlreadySpent");
+        if public_inputs.nullifiers.len() != public_inputs.consistency_weeks {
+            return Err(VerifierError::NullifierCountMismatch);
         }
 
-        // --- 4. Verify the Groth16 proof ---
-        // The Noir circuit verification key would be embedded here. Replace this
-        // stub with the actual verifier logic once the Noir circuit is compiled.
-        let proof_valid = Self::stub_verify_groth16(&env, &proof, &public_inputs);
-        assert!(proof_valid, "ProofInvalid");
+        let (savings_id, groth16_id) = Self::contract_ids(&env)?;
 
-        // --- 5. Record credit tier ---
+        // 1. Bind the proof to the current on-chain Merkle root.
+        let savings = SavingsClient::new(&env, &savings_id);
+        if savings.get_merkle_root() != public_inputs.commitment_root {
+            return Err(VerifierError::CommitmentRootMismatch);
+        }
+
+        // 2. Confirm each nullifier in the proof was actually recorded
+        //    on-chain by a prior deposit. Existence check — not a
+        //    double-spend guard (re-proving before TTL is allowed).
+        for nullifier in public_inputs.nullifiers.iter() {
+            if !savings.is_nullifier_spent(&nullifier) {
+                return Err(VerifierError::NullifierNotRecorded);
+            }
+        }
+
+        // 3. Delegate the cryptographic check.
+        let mut g16_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        g16_inputs.push_back(public_inputs.commitment_root.clone());
+        g16_inputs.push_back(Self::u64_to_bytes(&env, public_inputs.min_weekly_amount));
+        g16_inputs.push_back(Self::u32_to_bytes(&env, public_inputs.consistency_weeks));
+        for n in public_inputs.nullifiers.iter() {
+            g16_inputs.push_back(n);
+        }
+
+        let g16 = Groth16Client::new(&env, &groth16_id);
+        if !g16.verify(&proof, &g16_inputs) {
+            env.events().publish(
+                (symbol_short!("proof"), symbol_short!("rejected")),
+                wallet.clone(),
+            );
+            return Err(VerifierError::ProofInvalid);
+        }
+
+        // 4. Record credit. Overwrites any prior record for this wallet.
         let now = env.ledger().timestamp();
+        let expires_at = now + CREDIT_TTL_SECS;
         let record = CreditRecord {
-            wallet: caller.clone(),
+            wallet: wallet.clone(),
             tier: tier.clone(),
             verified_at: now,
             consistency_weeks: public_inputs.consistency_weeks,
-            expires_at: now + CREDIT_TTL_SECS,
+            expires_at,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::CreditRecord(caller.clone()), &record);
-
-        // --- 6. Emit event ---
-        env.events().publish(
-            (symbol_short!("credit"), symbol_short!("verified")),
-            (
-                caller,
-                public_inputs.consistency_weeks,
-                now + CREDIT_TTL_SECS,
-            ),
+        let key = DataKey::CreditRecord(wallet.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_LEDGERS / 2,
+            PERSISTENT_TTL_LEDGERS,
         );
 
-        true
+        env.events().publish(
+            (symbol_short!("credit"), symbol_short!("verified")),
+            (wallet, public_inputs.consistency_weeks, expires_at),
+        );
+
+        Ok(tier)
     }
 
     // -----------------------------------------------------------------------
-    // Read functions
+    // Reads
     // -----------------------------------------------------------------------
 
-    /// Returns the most recent valid `CreditRecord` for `wallet`, or `None`
-    /// if no record exists or the record has expired.
+    /// Returns the most recent non-expired `CreditRecord` for `wallet`, or
+    /// `None` if no record exists or the record has expired.
     pub fn get_credit_tier(env: Env, wallet: Address) -> Option<CreditRecord> {
-        let record: Option<CreditRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CreditRecord(wallet.clone()));
-
+        let key = DataKey::CreditRecord(wallet.clone());
+        let record: Option<CreditRecord> = env.storage().persistent().get(&key);
         match record {
             None => None,
             Some(r) => {
-                let now = env.ledger().timestamp();
-                if now > r.expires_at {
-                    // Emit expiry event and return None.
+                if env.ledger().timestamp() > r.expires_at {
                     env.events().publish(
                         (symbol_short!("credit"), symbol_short!("expired")),
                         (wallet, r.expires_at),
@@ -194,138 +265,65 @@ impl VerifierContract {
         }
     }
 
-    /// Returns `true` if `wallet` holds a non-expired credit record.
-    /// Lending protocols can use this as a simple gate before `get_credit_tier`.
+    /// Returns `true` iff `wallet` currently has a non-expired credit record.
     pub fn is_credit_valid(env: Env, wallet: Address) -> bool {
         Self::get_credit_tier(env, wallet).is_some()
     }
 
-    /// Returns the Groth16 verification key embedded in the contract.
-    /// Used by tooling and auditors to confirm the correct circuit.
-    pub fn get_verification_key(env: Env) -> Bytes {
-        // Replace with the real serialised verification key at deployment time.
-        Bytes::from_array(&env, &[0u8; 32])
+    /// Returns the Groth16 verification key embedded in the linked groth16
+    /// contract. Convenience pass-through for tooling/auditors so they can
+    /// confirm the circuit without first looking up the groth16 address.
+    pub fn get_verification_key(env: Env) -> Result<Bytes, VerifierError> {
+        let (_, groth16_id) = Self::contract_ids(&env)?;
+        let g16 = Groth16Client::new(&env, &groth16_id);
+        Ok(g16.get_verification_key())
+    }
+
+    /// Returns the (savings, groth16) addresses this contract is bound to.
+    pub fn get_linked_contracts(env: Env) -> Result<(Address, Address), VerifierError> {
+        Self::contract_ids(&env)
     }
 
     // -----------------------------------------------------------------------
-    // Internal helpers
+    // Internal
     // -----------------------------------------------------------------------
 
-    /// Map `consistency_weeks` to a `CreditTier`, panicking on unknown values.
-    fn weeks_to_tier(weeks: u32) -> CreditTier {
+    fn contract_ids(env: &Env) -> Result<(Address, Address), VerifierError> {
+        let savings = env
+            .storage()
+            .instance()
+            .get(&DataKey::SavingsContractId)
+            .ok_or(VerifierError::NotInitialized)?;
+        let groth16 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Groth16ContractId)
+            .ok_or(VerifierError::NotInitialized)?;
+        Ok((savings, groth16))
+    }
+
+    fn weeks_to_tier(weeks: u32) -> Result<CreditTier, VerifierError> {
         match weeks {
-            8 => CreditTier::Medium,
-            12 => CreditTier::Low,
-            24 => CreditTier::VeryLow,
-            _ => panic!("InvalidConsistencyWeeks"),
+            8 => Ok(CreditTier::Medium),
+            12 => Ok(CreditTier::Low),
+            24 => Ok(CreditTier::VeryLow),
+            _ => Err(VerifierError::InvalidConsistencyWeeks),
         }
     }
 
-    /// Placeholder Groth16 verifier — always returns `true` in the scaffold.
-    /// Replace with actual pairing-based verification once the Noir circuit
-    /// verification key is available.
-    fn stub_verify_groth16(
-        _env: &Env,
-        _proof: &Bytes,
-        _public_inputs: &PublicInputs,
-    ) -> bool {
-        // TODO: implement real Groth16 pairing check.
-        true
+    fn u64_to_bytes(env: &Env, v: u64) -> BytesN<32> {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&v.to_be_bytes());
+        BytesN::from_array(env, &out)
+    }
+
+    fn u32_to_bytes(env: &Env, v: u32) -> BytesN<32> {
+        let mut out = [0u8; 32];
+        out[28..32].copy_from_slice(&v.to_be_bytes());
+        BytesN::from_array(env, &out)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
-    fn make_env() -> Env {
-        Env::default()
-    }
-
-    fn make_hash(env: &Env, seed: u8) -> BytesN<32> {
-        BytesN::from_array(env, &[seed; 32])
-    }
-
-    fn make_public_inputs(env: &Env, weeks: u32) -> PublicInputs {
-        let mut nullifiers = Vec::new(env);
-        for i in 0..weeks {
-            nullifiers.push_back(make_hash(env, i as u8));
-        }
-        PublicInputs {
-            commitment_root: make_hash(env, 0),
-            min_weekly_amount: 1_000_000,
-            consistency_weeks: weeks,
-            nullifiers,
-        }
-    }
-
-    fn deploy_and_init(env: &Env) -> (Address, VerifierContractClient) {
-        let savings_id = Address::generate(env);
-        let contract_id = env.register_contract(None, VerifierContract);
-        let client = VerifierContractClient::new(env, &contract_id);
-        client.initialize(&savings_id);
-        (contract_id, client)
-    }
-
-    #[test]
-    fn test_valid_proof_records_credit() {
-        let env = make_env();
-        let (_, client) = deploy_and_init(&env);
-        let proof = Bytes::from_array(&env, &[0u8; 64]);
-
-        let result = client.verify_proof(&proof, &make_public_inputs(&env, 8));
-        assert!(result);
-    }
-
-    #[test]
-    #[should_panic(expected = "InvalidConsistencyWeeks")]
-    fn test_invalid_week_count_rejected() {
-        let env = make_env();
-        let (_, client) = deploy_and_init(&env);
-        let proof = Bytes::from_array(&env, &[0u8; 64]);
-
-        client.verify_proof(&proof, &make_public_inputs(&env, 7));
-    }
-
-    #[test]
-    fn test_medium_tier_for_8_weeks() {
-        let env = make_env();
-        let (contract_id, client) = deploy_and_init(&env);
-        let proof = Bytes::from_array(&env, &[0u8; 64]);
-
-        client.verify_proof(&proof, &make_public_inputs(&env, 8));
-
-        // Credit record should exist (is_credit_valid uses current_contract_address
-        // as wallet in the stub; adjust once caller routing is wired up).
-        // This test exercises the tier mapping path.
-        assert!(VerifierContract::weeks_to_tier(8) == CreditTier::Medium);
-    }
-
-    #[test]
-    fn test_low_tier_for_12_weeks() {
-        assert!(VerifierContract::weeks_to_tier(12) == CreditTier::Low);
-    }
-
-    #[test]
-    fn test_very_low_tier_for_24_weeks() {
-        assert!(VerifierContract::weeks_to_tier(24) == CreditTier::VeryLow);
-    }
-
-    #[test]
-    fn test_double_initialize_panics() {
-        let env = make_env();
-        let (_, client) = deploy_and_init(&env);
-        let savings_id = Address::generate(&env);
-        // Second init should panic.
-        let result = std::panic::catch_unwind(|| {
-            client.initialize(&savings_id);
-        });
-        // We just verify the flow runs; in the soroban test env panics propagate.
-        let _ = result;
-    }
-}
+mod test;

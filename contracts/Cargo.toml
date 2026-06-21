@@ -1,12 +1,13 @@
 [workspace]
 members = [
     "savings",
+    "groth16",
     "verifier",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { version = "21.0.0" }
 
 [profile.release]
 opt-level = "z"

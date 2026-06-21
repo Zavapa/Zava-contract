@@ -1,0 +1,1 @@
+/home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/target/debug/libverifier.rlib: /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/groth16/src/lib.rs /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/savings/src/lib.rs /home/olowo/Desktop/my\ projects/Zavapa/contract/contracts/verifier/src/lib.rs
