@@ -43,10 +43,16 @@ pub struct Commitment {
 pub enum DataKey {
     /// `Vec<Commitment>` — all deposits ever recorded.
     Commitments,
-    /// `BytesN<32>` — current Merkle root over commitment hashes.
+    /// `BytesN<32>` — current chain hash over commitment hashes (public
+    /// progress fingerprint; not used for ZK verification).
     MerkleRoot,
-    /// `bool` — whether a specific nullifier has been spent.
+    /// `bool` — whether a specific nullifier has been recorded.
     NullifierSpent(BytesN<32>),
+    /// `bool` — whether a specific commitment has been recorded.
+    /// Queried by the verifier contract to bind a proof to real on-chain
+    /// commitments (preventing amount-inflation attacks where the prover
+    /// fabricates commitments the savings contract never saw).
+    CommitmentRecorded(BytesN<32>),
     /// `u32` — last recorded week number (for gap detection).
     LastWeek,
 }
@@ -125,7 +131,7 @@ impl SavingsContract {
         }
 
         let entry = Commitment {
-            hash: commitment,
+            hash: commitment.clone(),
             nullifier: nullifier.clone(),
             week_number,
             timestamp: env.ledger().timestamp(),
@@ -138,10 +144,12 @@ impl SavingsContract {
             .unwrap_or_else(|| Vec::new(&env));
         commitments.push_back(entry);
 
+        let commitment_key = DataKey::CommitmentRecorded(commitment);
         env.storage()
             .persistent()
             .set(&DataKey::Commitments, &commitments);
         env.storage().persistent().set(&spent_key, &true);
+        env.storage().persistent().set(&commitment_key, &true);
         env.storage()
             .persistent()
             .set(&DataKey::LastWeek, &week_number);
@@ -153,11 +161,12 @@ impl SavingsContract {
 
         // Refresh TTL on the entries we just touched so the deposit history
         // and root survive the default rent window.
-        let touched: [DataKey; 4] = [
+        let touched: [DataKey; 5] = [
             DataKey::Commitments,
             DataKey::MerkleRoot,
             DataKey::LastWeek,
             DataKey::NullifierSpent(nullifier),
+            commitment_key,
         ];
         for k in touched.iter() {
             env.storage()
@@ -206,6 +215,17 @@ impl SavingsContract {
         env.storage()
             .persistent()
             .get(&DataKey::NullifierSpent(nullifier))
+            .unwrap_or(false)
+    }
+
+    /// Returns whether a commitment has been recorded by a prior deposit.
+    /// The verifier contract calls this for each commitment in a credit
+    /// proof to bind the proof to real on-chain savings (preventing the
+    /// prover from claiming amounts that were never actually committed).
+    pub fn is_commitment_recorded(env: Env, commitment: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentRecorded(commitment))
             .unwrap_or(false)
     }
 

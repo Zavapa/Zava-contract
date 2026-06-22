@@ -68,6 +68,18 @@ fn nullifier_spent_flag() {
 }
 
 #[test]
+fn commitment_recorded_flag() {
+    let env = Env::default();
+    let client = deploy(&env);
+    let commitment = make_hash(&env, 42);
+    assert!(!client.is_commitment_recorded(&commitment));
+    client.deposit(&commitment, &make_hash(&env, 99), &0u32);
+    assert!(client.is_commitment_recorded(&commitment));
+    // Untouched commitment stays false.
+    assert!(!client.is_commitment_recorded(&make_hash(&env, 7)));
+}
+
+#[test]
 fn range_query() {
     let env = Env::default();
     let client = deploy(&env);

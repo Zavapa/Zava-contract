@@ -2,21 +2,23 @@
 
 //! # Verifier / Credit Contract
 //!
-//! Business-logic layer that sits on top of the savings + groth16 contracts.
+//! Business-logic layer sitting on top of the savings contract and three
+//! Honk verifier contracts (one per credit tier: 8 / 12 / 24 weeks).
 //!
 //! Flow:
-//!   1. A wallet calls [`VerifierContract::verify_proof`] with a Noir-generated
-//!      Groth16 proof and the public inputs the proof was generated against.
-//!   2. The contract cross-checks the commitment root against the savings
-//!      contract (binding the proof to current on-chain state) and confirms
-//!      each nullifier in the proof was actually recorded by a prior deposit.
-//!   3. It delegates the cryptographic check to the groth16 contract.
-//!   4. On success, it records a `CreditRecord` for the calling wallet with
-//!      a 90-day expiry. Re-proving before expiry overwrites the record.
+//!   1. A wallet calls [`VerifierContract::verify_proof`] with a Noir
+//!      UltraHonk proof and the public inputs it was generated against.
+//!   2. The contract picks the right Honk verifier instance based on
+//!      `consistency_weeks` (8 → Medium, 12 → Low, 24 → VeryLow).
+//!   3. It checks each commitment + nullifier in the public inputs was
+//!      actually recorded by a prior deposit in the savings contract.
+//!      This is what binds the proof to real on-chain state.
+//!   4. It delegates the cryptographic check to the chosen Honk verifier.
+//!   5. On success, it records a `CreditRecord` for the calling wallet
+//!      with a 90-day expiry. Re-proving before expiry overwrites it.
 //!
-//! There is no admin key, no upgrade path, and no mutable configuration —
-//! the savings and groth16 contract addresses are set exactly once at
-//! initialisation.
+//! No admin key, no upgrade path, no mutable configuration. The savings
+//! and Honk verifier addresses are set exactly once at initialisation.
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype,
@@ -28,19 +30,17 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 //
 // Declared inline so this contract does not pull the other contracts' WASM
-// exports into its own binary (which would cause duplicate-symbol linker
-// errors). Only primitive SDK types cross the boundary — the savings and
-// groth16 contracts are free to evolve their internal structs without
-// breaking this client.
+// exports into its own binary. Only primitive SDK types cross the boundary.
 
 #[contractclient(name = "SavingsClient")]
 pub trait SavingsInterface {
     fn get_merkle_root(env: Env) -> BytesN<32>;
     fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool;
+    fn is_commitment_recorded(env: Env, commitment: BytesN<32>) -> bool;
 }
 
-#[contractclient(name = "Groth16Client")]
-pub trait Groth16Interface {
+#[contractclient(name = "HonkVerifierClient")]
+pub trait HonkVerifierInterface {
     fn verify(env: Env, proof: Bytes, public_inputs: Vec<BytesN<32>>) -> bool;
     fn get_verification_key(env: Env) -> Bytes;
 }
@@ -73,16 +73,16 @@ pub struct CreditRecord {
 }
 
 /// Public inputs supplied alongside the ZK proof.
+///
+/// `commitments` and `nullifiers` must each have length == `consistency_weeks`.
+/// The verifier checks each one exists in the savings contract before
+/// delegating to the Honk verifier.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PublicInputs {
-    /// Must match the current Merkle root in the savings contract.
-    pub commitment_root: BytesN<32>,
-    /// Minimum weekly savings threshold claimed (in stroops).
     pub min_weekly_amount: u64,
-    /// Number of consecutive weeks claimed (8, 12, or 24).
     pub consistency_weeks: u32,
-    /// One nullifier per deposit period claimed.
+    pub commitments: Vec<BytesN<32>>,
     pub nullifiers: Vec<BytesN<32>>,
 }
 
@@ -93,7 +93,12 @@ pub struct PublicInputs {
 #[contracttype]
 pub enum DataKey {
     SavingsContractId,
-    Groth16ContractId,
+    /// Honk verifier for the 8-week (Medium) tier.
+    Honk8w,
+    /// Honk verifier for the 12-week (Low) tier.
+    Honk12w,
+    /// Honk verifier for the 24-week (VeryLow) tier.
+    Honk24w,
     CreditRecord(Address),
 }
 
@@ -108,10 +113,11 @@ pub enum VerifierError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     InvalidConsistencyWeeks = 3,
-    CommitmentRootMismatch = 4,
-    NullifierNotRecorded = 5,
-    NullifierCountMismatch = 6,
-    ProofInvalid = 7,
+    NullifierCountMismatch = 4,
+    CommitmentCountMismatch = 5,
+    NullifierNotRecorded = 6,
+    CommitmentNotRecorded = 7,
+    ProofInvalid = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +143,14 @@ impl VerifierContract {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    /// Bind this contract to a specific savings + groth16 deployment.
-    /// Callable exactly once.
+    /// Bind this contract to a savings deployment + three Honk verifier
+    /// instances (one per credit tier). Callable exactly once.
     pub fn initialize(
         env: Env,
         savings_contract: Address,
-        groth16_contract: Address,
+        honk_8w: Address,
+        honk_12w: Address,
+        honk_24w: Address,
     ) -> Result<(), VerifierError> {
         if env.storage().instance().has(&DataKey::SavingsContractId) {
             return Err(VerifierError::AlreadyInitialized);
@@ -150,9 +158,9 @@ impl VerifierContract {
         env.storage()
             .instance()
             .set(&DataKey::SavingsContractId, &savings_contract);
-        env.storage()
-            .instance()
-            .set(&DataKey::Groth16ContractId, &groth16_contract);
+        env.storage().instance().set(&DataKey::Honk8w, &honk_8w);
+        env.storage().instance().set(&DataKey::Honk12w, &honk_12w);
+        env.storage().instance().set(&DataKey::Honk24w, &honk_24w);
         Ok(())
     }
 
@@ -160,11 +168,10 @@ impl VerifierContract {
     // Core verification
     // -----------------------------------------------------------------------
 
-    /// Verify a Noir-generated Groth16 proof and, on success, record a
+    /// Verify a Noir-generated UltraHonk proof and, on success, record a
     /// credit tier for `wallet`.
     ///
-    /// `wallet` must authorise the call — the credit record is keyed by it,
-    /// so the wallet that pays for verification earns the reputation.
+    /// `wallet` must authorise the call — the credit record is keyed by it.
     pub fn verify_proof(
         env: Env,
         wallet: Address,
@@ -178,35 +185,47 @@ impl VerifierContract {
         if public_inputs.nullifiers.len() != public_inputs.consistency_weeks {
             return Err(VerifierError::NullifierCountMismatch);
         }
-
-        let (savings_id, groth16_id) = Self::contract_ids(&env)?;
-
-        // 1. Bind the proof to the current on-chain Merkle root.
-        let savings = SavingsClient::new(&env, &savings_id);
-        if savings.get_merkle_root() != public_inputs.commitment_root {
-            return Err(VerifierError::CommitmentRootMismatch);
+        if public_inputs.commitments.len() != public_inputs.consistency_weeks {
+            return Err(VerifierError::CommitmentCountMismatch);
         }
 
-        // 2. Confirm each nullifier in the proof was actually recorded
-        //    on-chain by a prior deposit. Existence check — not a
-        //    double-spend guard (re-proving before TTL is allowed).
+        let savings_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SavingsContractId)
+            .ok_or(VerifierError::NotInitialized)?;
+        let honk_id = Self::honk_for_tier(&env, &tier)?;
+
+        let savings = SavingsClient::new(&env, &savings_id);
+
+        // Bind each public commitment and nullifier to a real on-chain
+        // deposit. This is the proof-of-state-integration check.
+        for commitment in public_inputs.commitments.iter() {
+            if !savings.is_commitment_recorded(&commitment) {
+                return Err(VerifierError::CommitmentNotRecorded);
+            }
+        }
         for nullifier in public_inputs.nullifiers.iter() {
             if !savings.is_nullifier_spent(&nullifier) {
                 return Err(VerifierError::NullifierNotRecorded);
             }
         }
 
-        // 3. Delegate the cryptographic check.
-        let mut g16_inputs: Vec<BytesN<32>> = Vec::new(&env);
-        g16_inputs.push_back(public_inputs.commitment_root.clone());
-        g16_inputs.push_back(Self::u64_to_bytes(&env, public_inputs.min_weekly_amount));
-        g16_inputs.push_back(Self::u32_to_bytes(&env, public_inputs.consistency_weeks));
+        // Delegate the cryptographic proof check. Public-input ordering here
+        // MUST match the order the Noir circuits declare:
+        //   [min_weekly_amount, consistency_weeks, commitments…, nullifiers…]
+        let mut honk_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        honk_inputs.push_back(Self::u64_to_bytes(&env, public_inputs.min_weekly_amount));
+        honk_inputs.push_back(Self::u32_to_bytes(&env, public_inputs.consistency_weeks));
+        for c in public_inputs.commitments.iter() {
+            honk_inputs.push_back(c);
+        }
         for n in public_inputs.nullifiers.iter() {
-            g16_inputs.push_back(n);
+            honk_inputs.push_back(n);
         }
 
-        let g16 = Groth16Client::new(&env, &groth16_id);
-        if !g16.verify(&proof, &g16_inputs) {
+        let honk = HonkVerifierClient::new(&env, &honk_id);
+        if !honk.verify(&proof, &honk_inputs) {
             env.events().publish(
                 (symbol_short!("proof"), symbol_short!("rejected")),
                 wallet.clone(),
@@ -214,7 +233,7 @@ impl VerifierContract {
             return Err(VerifierError::ProofInvalid);
         }
 
-        // 4. Record credit. Overwrites any prior record for this wallet.
+        // Record credit. Overwrites any prior record for this wallet.
         let now = env.ledger().timestamp();
         let expires_at = now + CREDIT_TTL_SECS;
         let record = CreditRecord {
@@ -270,36 +289,55 @@ impl VerifierContract {
         Self::get_credit_tier(env, wallet).is_some()
     }
 
-    /// Returns the Groth16 verification key embedded in the linked groth16
-    /// contract. Convenience pass-through for tooling/auditors so they can
-    /// confirm the circuit without first looking up the groth16 address.
-    pub fn get_verification_key(env: Env) -> Result<Bytes, VerifierError> {
-        let (_, groth16_id) = Self::contract_ids(&env)?;
-        let g16 = Groth16Client::new(&env, &groth16_id);
-        Ok(g16.get_verification_key())
+    /// Returns the verification key embedded in the Honk verifier contract
+    /// for the requested credit tier. Convenience pass-through for tooling.
+    pub fn get_verification_key(env: Env, tier: CreditTier) -> Result<Bytes, VerifierError> {
+        let honk_id = Self::honk_for_tier(&env, &tier)?;
+        let honk = HonkVerifierClient::new(&env, &honk_id);
+        Ok(honk.get_verification_key())
     }
 
-    /// Returns the (savings, groth16) addresses this contract is bound to.
-    pub fn get_linked_contracts(env: Env) -> Result<(Address, Address), VerifierError> {
-        Self::contract_ids(&env)
+    /// Returns (savings, honk_8w, honk_12w, honk_24w).
+    pub fn get_linked_contracts(
+        env: Env,
+    ) -> Result<(Address, Address, Address, Address), VerifierError> {
+        let savings = env
+            .storage()
+            .instance()
+            .get(&DataKey::SavingsContractId)
+            .ok_or(VerifierError::NotInitialized)?;
+        let g8 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Honk8w)
+            .ok_or(VerifierError::NotInitialized)?;
+        let g12 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Honk12w)
+            .ok_or(VerifierError::NotInitialized)?;
+        let g24 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Honk24w)
+            .ok_or(VerifierError::NotInitialized)?;
+        Ok((savings, g8, g12, g24))
     }
 
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
 
-    fn contract_ids(env: &Env) -> Result<(Address, Address), VerifierError> {
-        let savings = env
-            .storage()
+    fn honk_for_tier(env: &Env, tier: &CreditTier) -> Result<Address, VerifierError> {
+        let key = match tier {
+            CreditTier::Medium => DataKey::Honk8w,
+            CreditTier::Low => DataKey::Honk12w,
+            CreditTier::VeryLow => DataKey::Honk24w,
+        };
+        env.storage()
             .instance()
-            .get(&DataKey::SavingsContractId)
-            .ok_or(VerifierError::NotInitialized)?;
-        let groth16 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Groth16ContractId)
-            .ok_or(VerifierError::NotInitialized)?;
-        Ok((savings, groth16))
+            .get(&key)
+            .ok_or(VerifierError::NotInitialized)
     }
 
     fn weeks_to_tier(weeks: u32) -> Result<CreditTier, VerifierError> {
@@ -323,7 +361,6 @@ impl VerifierContract {
         BytesN::from_array(env, &out)
     }
 }
-
 
 #[cfg(test)]
 mod test;

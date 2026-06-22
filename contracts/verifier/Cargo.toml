@@ -12,7 +12,7 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 savings = { path = "../savings" }
-groth16 = { path = "../groth16" }
+honk_verifier = { path = "../honk_verifier" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

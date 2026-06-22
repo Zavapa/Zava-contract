@@ -1,0 +1,7 @@
+[package]
+name = "zava_24w"
+type = "bin"
+authors = ["Lawrence"]
+compiler_version = ">=0.32.0"
+
+[dependencies]

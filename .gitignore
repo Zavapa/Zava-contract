@@ -1,5 +1,7 @@
 /target
+**/target/
 **/*.wasm
 .env
+.deploy.*.env
 *.secret
 **/test_snapshots/
