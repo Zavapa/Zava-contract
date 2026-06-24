@@ -22,7 +22,7 @@ cd "$REPO_ROOT"
 
 NETWORK="${1:-testnet}"
 SOURCE="${SOURCE:-default}"
-WASM_DIR="contracts/target/wasm32-unknown-unknown/release"
+WASM_DIR="contracts/target/wasm32v1-none/release"
 
 if ! command -v stellar >/dev/null 2>&1; then
     echo "error: 'stellar' CLI not found in PATH" >&2
@@ -81,7 +81,7 @@ deploy_honk() {
             --network "$NETWORK" \
             -- initialize \
             --vk_bytes "$vk_hex" \
-            --num_public_inputs "$public_input_count"
+            --num_public_inputs "$public_input_count" >/dev/null
     else
         echo "  WARNING: no VK file for ${tier_weeks}w tier — initialising with placeholder"
         local placeholder_hex
@@ -92,7 +92,7 @@ deploy_honk() {
             --network "$NETWORK" \
             -- initialize \
             --vk_bytes "$placeholder_hex" \
-            --num_public_inputs "$public_input_count"
+            --num_public_inputs "$public_input_count" >/dev/null
     fi
 
     echo "$honk_id"

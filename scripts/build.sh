@@ -46,19 +46,14 @@ fi
 
 # ---------- Soroban contracts ---------------------------------------------
 
-if ! rustup target list --installed | grep -q wasm32-unknown-unknown; then
-    echo "Adding rust target wasm32-unknown-unknown"
-    rustup target add wasm32-unknown-unknown
-fi
-
 step "Building Soroban contracts (release WASM)"
-(cd contracts && cargo build --workspace --target wasm32-unknown-unknown --release)
+(cd contracts && stellar contract build)
 
 # ---------- Summary --------------------------------------------------------
 
 step "Artifacts"
 echo "Soroban WASM:"
-ls -lh contracts/target/wasm32-unknown-unknown/release/*.wasm | awk '{print "  " $NF " (" $5 ")"}'
+ls -lh contracts/target/wasm32v1-none/release/*.wasm | awk '{print "  " $NF " (" $5 ")"}'
 
 echo "Noir circuit outputs:"
 for tier in zava_8w zava_12w zava_24w; do
