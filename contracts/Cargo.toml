@@ -3,6 +3,8 @@ members = [
     "savings",
     "honk_verifier",
     "verifier",
+    "zava_vault",
+    "zava_credit",
 ]
 resolver = "2"
 
