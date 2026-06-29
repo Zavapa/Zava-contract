@@ -1,0 +1,7 @@
+[package]
+name = "zava_partial_withdraw"
+type = "bin"
+authors = ["Zava"]
+compiler_version = ">=0.32.0"
+
+[dependencies]

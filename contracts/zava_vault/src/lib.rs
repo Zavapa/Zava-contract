@@ -521,6 +521,177 @@ impl ZavaVault {
     }
 
     // ------------------------------------------------------------------------
+    // Partial withdraw — UTXO-style with change
+    // ------------------------------------------------------------------------
+
+    /// Withdraw part of a deposit, leaving the remainder as a new shielded
+    /// commitment ("change") in the pool.
+    ///
+    /// This is the standard UTXO model used by Tornado Cash, Zcash and the
+    /// Nethermind PoC. The caller:
+    ///   1. Spends the input commitment (its nullifier is marked used).
+    ///   2. Receives `withdraw_amount` tokens at `recipient`.
+    ///   3. Inserts `change_commitment` into the Merkle tree representing the
+    ///      remaining `input_amount - withdraw_amount` still locked.
+    ///
+    /// The ZK proof (currently stub-checked) must demonstrate:
+    ///   * Knowledge of the secret behind `in_commitment`.
+    ///   * `change_commitment = hash(secret, input_amount - withdraw_amount)`.
+    ///   * `withdraw_amount > 0` and `withdraw_amount ≤ input_amount`.
+    pub fn partial_withdraw(
+        env: Env,
+        proof: Bytes,
+        in_commitment: BytesN<32>,
+        in_nullifier: BytesN<32>,
+        in_root: BytesN<32>,
+        recipient: Address,
+        recipient_hash: BytesN<32>,
+        withdraw_amount: i128,
+        change_commitment: BytesN<32>,
+    ) -> Result<u32, VaultError> {
+        Self::check_initialized(&env)?;
+        Self::check_not_paused(&env)?;
+
+        if withdraw_amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+
+        // 1. Nullifier must be fresh.
+        let nul_key = DataKey::NullifierSpent(in_nullifier.clone());
+        if env.storage().persistent().get(&nul_key).unwrap_or(false) {
+            return Err(VaultError::NullifierAlreadySpent);
+        }
+
+        // 2. Root must be recent.
+        let roots: Map<u32, BytesN<32>> = env
+            .storage().instance()
+            .get(&DataKey::Roots)
+            .unwrap_or_else(|| Map::new(&env));
+        if !is_known_root(&roots, &in_root) {
+            return Err(VaultError::UnknownRoot);
+        }
+
+        // 3. Commitment-nullifier binding (same anti-theft guard as full withdraw).
+        let cn_key = DataKey::CommitmentNullifierHash(in_commitment.clone());
+        let stored_binding: Option<BytesN<32>> = env.storage().persistent().get(&cn_key);
+        match stored_binding {
+            None => return Err(VaultError::InvalidProof),
+            Some(stored) => {
+                let claimed = Self::commitment_nullifier_hash(
+                    &env, &in_commitment, &in_nullifier,
+                );
+                if claimed != stored {
+                    return Err(VaultError::InvalidProof);
+                }
+            }
+        }
+
+        // 4. Recipient hash bound to the recipient address.
+        let expected_recipient_hash = Self::hash_address(&env, &recipient);
+        if expected_recipient_hash != recipient_hash {
+            return Err(VaultError::RecipientMismatch);
+        }
+
+        // 5. Verify ZK proof. Public input layout:
+        //    [in_commitment, in_root, in_nullifier, recipient_hash,
+        //     withdraw_amount_bytes, change_commitment]
+        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
+        let mut pi: Vec<BytesN<32>> = Vec::new(&env);
+        pi.push_back(in_commitment);
+        pi.push_back(in_root);
+        pi.push_back(in_nullifier.clone());
+        pi.push_back(recipient_hash);
+        pi.push_back(Self::i128_to_bytes32(&env, withdraw_amount));
+        pi.push_back(change_commitment.clone());
+
+        if !HonkVerifierClient::new(&env, &verifier).verify(&proof, &pi) {
+            return Err(VaultError::InvalidProof);
+        }
+
+        // 6. Mark old nullifier spent.
+        env.storage().persistent().set(&nul_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&nul_key, PERSISTENT_TTL / 2, PERSISTENT_TTL);
+
+        // 7. Insert change commitment into the Merkle tree.
+        //    Note: this change has NO commitment-nullifier binding yet — that
+        //    must be stored by a later operation when the user re-spends it.
+        //    For now we treat it as a "child" of the original deposit and the
+        //    user's next spend must provide the change-nullifier explicitly.
+        let next_index: u32 = env.storage().instance().get(&DataKey::NextLeafIndex).unwrap_or(0);
+        let current_root_index: u32 = env.storage().instance().get(&DataKey::CurrentRootIndex).unwrap_or(0);
+        let mut roots2: Map<u32, BytesN<32>> = env.storage().instance().get(&DataKey::Roots).unwrap_or_else(|| Map::new(&env));
+        let mut filled: Map<u32, BytesN<32>> = env.storage().instance().get(&DataKey::FilledSubtrees).unwrap_or_else(|| Map::new(&env));
+        let (_new_root, new_next, new_root_idx) = insert(
+            &env, change_commitment.clone(), &mut filled, &mut roots2, next_index, current_root_index,
+        );
+        env.storage().instance().set(&DataKey::NextLeafIndex, &new_next);
+        env.storage().instance().set(&DataKey::CurrentRootIndex, &new_root_idx);
+        env.storage().instance().set(&DataKey::Roots, &roots2);
+        env.storage().instance().set(&DataKey::FilledSubtrees, &filled);
+
+        // 8. Update total locked.
+        let prev: i128 = env.storage().instance().get(&DataKey::TotalLocked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalLocked, &(prev - withdraw_amount));
+
+        // 9. Release tokens to recipient.
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        TokenClient::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &withdraw_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("zava"), symbol_short!("partial")),
+            (in_nullifier, change_commitment, next_index, withdraw_amount),
+        );
+
+        Ok(next_index)
+    }
+
+    /// Bind a change commitment (created by a previous partial_withdraw) to a
+    /// nullifier. Lets the user re-spend the change with the same security
+    /// guarantees as a regular deposit. The user-provided nullifier must hash
+    /// to a known commitment-nullifier pairing the user can prove they own.
+    ///
+    /// We require ZK proof here so the user demonstrates ownership of the
+    /// change before binding a nullifier to it. The proof's public inputs:
+    ///   [change_commitment, change_nullifier]
+    pub fn bind_change_nullifier(
+        env: Env,
+        proof: Bytes,
+        change_commitment: BytesN<32>,
+        change_nullifier: BytesN<32>,
+    ) -> Result<(), VaultError> {
+        Self::check_initialized(&env)?;
+        Self::check_not_paused(&env)?;
+
+        let key = DataKey::CommitmentNullifierHash(change_commitment.clone());
+        if env.storage().persistent().has(&key) {
+            // Already bound — nothing to do.
+            return Ok(());
+        }
+
+        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
+        let mut pi: Vec<BytesN<32>> = Vec::new(&env);
+        pi.push_back(change_commitment.clone());
+        pi.push_back(change_nullifier.clone());
+        if !HonkVerifierClient::new(&env, &verifier).verify(&proof, &pi) {
+            return Err(VaultError::InvalidProof);
+        }
+
+        let binding = Self::commitment_nullifier_hash(&env, &change_commitment, &change_nullifier);
+        env.storage().persistent().set(&key, &binding);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL / 2, PERSISTENT_TTL);
+
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
     // Read-only helpers
     // ------------------------------------------------------------------------
 
@@ -665,6 +836,12 @@ impl ZavaVault {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&arr[16..32]);
         i128::from_be_bytes(buf)
+    }
+
+    fn i128_to_bytes32(env: &Env, v: i128) -> BytesN<32> {
+        let mut out = [0u8; 32];
+        out[16..32].copy_from_slice(&v.to_be_bytes());
+        BytesN::from_array(env, &out)
     }
 }
 
