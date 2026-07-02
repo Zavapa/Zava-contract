@@ -37,7 +37,637 @@ If you're new to ZK terminology, jump to the [Glossary](#glossary) first.
 
 ---
 
-## Table of contents
+## 🔬 How It Works — The Whole System On One Page
+
+This section is the deep dive: every contract, every circuit, the exact scoring formula, and diagrams showing where the data flows. If you only read one part of this README, read this one.
+
+### The 30-second version
+
+```
+   USER                        CIRCUIT                       CHAIN
+   ----                        -------                       -----
+
+  wallet ── signs ──► Freighter derives `secret`
+     │
+     │  Deposits (over N weeks):
+     │  commitment = pedersen_hash([secret, amount])
+     │  nullifier  = pedersen_hash([secret, week_number])
+     │  encrypted_note = AES-GCM({amount, nonce, week}, scan_key)
+     ▼
+  Vault.deposit(commitment, nullifier, amount, encrypted_note)
+     ├─► locks real tokens
+     ├─► stores sha256(commitment || nullifier)  ← anti-theft binding
+     ├─► inserts commitment into Merkle tree
+     └─► emits `zava/deposit` event  (encrypted_note is public,
+                                       but only scan_key can decrypt)
+
+   ─── weeks pass ───
+
+   ZK PROVER (browser, off-thread)
+     │
+     │  Private witness: secret + amounts + timestamps + week_numbers
+     │  Public inputs:   min_weekly_amount, consistency_weeks,
+     │                   commitments[N], nullifiers[N]
+     │
+     │  Circuit `zava_8w` (or 12w / 24w) verifies:
+     │    ∀i: commitment[i]  == pedersen(secret, amount[i])
+     │    ∀i: nullifier[i]   == pedersen(secret, week[i])
+     │    ∀i: amount[i]      ≥ min_weekly_amount
+     │    ∀i: week[i]        > week[i-1]                (strictly monotonic)
+     │    ∀i: gap in seconds > 0 AND ≤ 8 days
+     │
+     ▼  14,592-byte proof
+  ZavaCredit.claim_credit(wallet, proof, {range, commitments, nullifiers, weeks})
+     ├─► wallet.require_auth()
+     ├─► foreach: Vault.commitment_exists(c)
+     ├─► foreach: Vault.commitment_matches_nullifier(c, n)   ← proves ownership
+     ├─► HonkVerifier.verify(proof, public_inputs)
+     │      └─► Sumcheck + Shplemini + BN254 pairing (Protocol 26 host fns)
+     ├─► tier = weeks_to_tier(active_weeks)
+     ├─► loan_stroops = active_weeks × range_bound × tier_multiplier
+     └─► writes CreditRecord{wallet, tier, loan, expires_at = now + 90d}
+
+   LENDER queries ZavaCredit.get_credit_record(wallet)
+     └─► sees only: tier + loan cap + how many weeks were proven.
+         Does NOT see: amounts, secret, individual commitments,
+                       timestamps, or the wallet's private history.
+```
+
+### System architecture at a glance
+
+```
+                             ┌───────────────────────────┐
+                             │       BROWSER (WASM)      │
+                             │   @noir-lang/noir_js@0.9  │
+                             │    @aztec/bb.js@0.87.0    │
+                             │      (Web Worker)         │
+                             └────────────┬──────────────┘
+                                          │
+                                          │ 14,592-byte proof
+                                          │ 18–50 × 32-byte public inputs
+                                          ▼
+   ┌──────────────────────────── STELLAR TESTNET — Protocol 26 ────────────────────────┐
+   │                                                                                   │
+   │   ┌────────────┐          ┌───────────────┐          ┌─────────────────────────┐  │
+   │   │  SAVINGS   │          │ CREDIT        │          │  HONK VERIFIERS (5)     │  │
+   │   │            │◄─── uses │ VERIFIER      │ delegates│  ┌───────┐ ┌───────┐    │  │
+   │   │  ledger of │──────────│  (routes by   │──── to ─►│  │  8w   │ │  12w  │    │  │
+   │   │commitments │          │consistency_wks│          │  └───────┘ └───────┘    │  │
+   │   │+nullifiers │          └───────────────┘          │  ┌───────┐ ┌────────┐   │  │
+   │   └────────────┘                                     │  │  24w  │ │Shielded│   │  │
+   │                                                      │  └───────┘ └────────┘   │  │
+   │                                                      │        ┌─────────┐      │  │
+   │                                                      │        │ Partial │      │  │
+   │                                                      │        └─────────┘      │  │
+   │                                                      │  (each holds its own    │  │
+   │                                                      │   VK, verifies real     │  │
+   │                                                      │   Sumcheck + Shplemini) │  │
+   │                                                      └─────────────────────────┘  │
+   │                                                              ▲                    │
+   │   ┌────────────┐   uses   ┌────────────┐   delegates         │                    │
+   │   │VAULT (XLM) │◄─────────│ ZAVA CREDIT│──────── to  ────────┘                    │
+   │   ├────────────┤          │  bulletproof                                          │
+   │   │VAULT (USDC)│          │  savings-based│                                       │
+   │   │            │          │  loan sizing  │                                       │
+   │   │Merkle tree │          └───────────────┘                                       │
+   │   │commitments │                                                                  │
+   │   │nullifiers  │                                                                  │
+   │   │2 verifiers │                                                                  │
+   │   │per vault:  │                                                                  │
+   │   │shielded +  │                                                                  │
+   │   │partial     │                                                                  │
+   │   └────────────┘                                                                  │
+   │                                                                                   │
+   │                     BN254 host functions (CAP-74)                                 │
+   │                     Poseidon2 host functions (CAP-75)                             │
+   │                     Yardstick / Protocol 26 (live 2026-05-06)                     │
+   └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Contracts — What Each One Does And Why
+
+There are **five distinct contract types**, deployed as 10 instances on testnet. Each has a single well-defined responsibility. The composition is the whole point.
+
+### 1. Savings — the append-only commitment ledger
+
+- **File**: `contracts/savings/src/lib.rs`
+- **Address**: `CAEWAADG5Y2VM42VERCYMZUCCJIENBQFQDNICMX6WEDBMIPOQVE5D6DA`
+- **Job**: record weekly savings deposits as opaque commitments + nullifiers so the credit-verifier layer can later confirm "this claim references real historical data."
+- **Explicitly does NOT hold real tokens.** It's a book, not a wallet. The vault is where actual money lives.
+
+```
+     ┌───────────────────── SAVINGS CONTRACT ─────────────────────┐
+     │                                                            │
+     │   deposit(commitment, nullifier, week_number)              │
+     │     │                                                      │
+     │     ├─► reject if nullifier already spent                  │
+     │     ├─► enforce global LastWeek monotonic (gap ≤ 2)        │
+     │     ├─► append Commitment{hash, nullifier, week, ts}       │
+     │     ├─► set NullifierSpent[nullifier]  = true              │
+     │     ├─► set CommitmentRecorded[c]      = true              │
+     │     └─► recompute MerkleRoot                               │
+     │                                                            │
+     │   is_commitment_recorded(c) -> bool                        │
+     │   is_nullifier_spent(n)     -> bool                        │
+     │   get_merkle_root()         -> BytesN<32>                  │
+     │                                                            │
+     └────────────────────────────────────────────────────────────┘
+
+   Key design choice: NO require_auth on deposit. Privacy — no wallet
+   address is stored, no auth is recorded. Anyone can submit a
+   commitment; the crypto (secret unknown ⇒ can't generate a valid
+   circuit witness later) is what prevents forgery.
+```
+
+### 2. Vault (XLM + USDC) — the actual money box
+
+- **Files**: `contracts/zava_vault/src/lib.rs`
+- **Addresses**: `CDKAGIC…PZLM` (XLM), `CBZCANTD…REKP` (USDC) — one instance per asset
+- **Job**: hold real tokens behind a shielded pool. Users deposit, withdraw, transfer between commitments, or split via partial withdraw. Every operation except pure-info reads passes through a real UltraHonk verifier.
+
+```
+   ┌──────────────────────── VAULT CONTRACT ─────────────────────────┐
+   │                                                                 │
+   │   deposit(depositor, commitment, nullifier, amount, enc_note)   │
+   │     ├─► depositor.require_auth()                                │
+   │     ├─► pull `amount` tokens from depositor                     │
+   │     ├─► store sha256(commitment||nullifier) ← anti-theft binding│
+   │     ├─► insert commitment into Merkle tree (depth 20)           │
+   │     └─► emit `zava/deposit` event  (encrypted note goes public, │
+   │                                     only scan_key can decrypt)  │
+   │                                                                 │
+   │   withdraw(proof, public_inputs{root, nullifier,                │
+   │            recipient_hash, amount_bytes})                       │
+   │     ├─► check nullifier fresh                                   │
+   │     ├─► check root is in the recent-root ring                   │
+   │     ├─► check stored binding == sha256(commitment||nullifier)   │
+   │     ├─► check recipient_hash == pedersen(recipient_bytes)       │
+   │     ├─► ShieldedVerifier.verify(proof, 4 public inputs) ✓       │
+   │     ├─► mark nullifier spent                                    │
+   │     └─► transfer tokens out                                     │
+   │                                                                 │
+   │   partial_withdraw(proof, in_commitment, in_nullifier, in_root, │
+   │            recipient, recipient_hash, withdraw_amount,          │
+   │            change_commitment, encrypted_change_note)            │
+   │     ├─► same guards as withdraw                                 │
+   │     ├─► PartialVerifier.verify(proof, 6 public inputs) ✓        │
+   │     ├─► mark old nullifier spent                                │
+   │     ├─► insert change_commitment into Merkle tree               │
+   │     ├─► transfer withdraw_amount to recipient                   │
+   │     └─► emit `zava/partial` event with encrypted_change_note    │
+   │         ┌─────────────────────────────────────────────────┐     │
+   │         │ Recovery invariant: with only the wallet secret │     │
+   │         │ + on-chain events, a wallet can rebuild its     │     │
+   │         │ entire deposit + change history. localStorage   │     │
+   │         │ is a performance cache, not a source of truth.  │     │
+   │         └─────────────────────────────────────────────────┘     │
+   │                                                                 │
+   │   transfer_shielded(proof, in_nullifier, out_commitment, root)  │
+   │     ├─► ShieldedVerifier.verify(proof, 4 pi)  ✓                 │
+   │     │      (recipient_hash=0, amount_out=0 signal "in-pool")    │
+   │     └─► spend one commitment, create one — no token movement    │
+   └─────────────────────────────────────────────────────────────────┘
+
+   Key design choice: TWO verifier addresses stored in vault state.
+   `ShieldedVerifier` handles 4-input operations (withdraw + transfer).
+   `PartialVerifier`  handles 6-input operations (partial_withdraw).
+   Public-input arity is fixed by each honk_verifier's VK, so a
+   single verifier cannot serve both.
+```
+
+### 3. Honk Verifier — the pure crypto layer
+
+- **File**: `contracts/honk_verifier/src/lib.rs`
+- **5 deployed instances**: one per circuit, each initialized once with the matching VK.
+- **Job**: pure cryptographic verification, zero business logic. Given a proof, public inputs, and the embedded VK, run Sumcheck + Shplemini + a BN254 pairing check. Return `bool`.
+
+```
+   ┌──────────────────── HONK VERIFIER ─────────────────────┐
+   │                                                        │
+   │   initialize(vk_bytes, num_public_inputs)              │
+   │     ├─► UltraHonkVerifier::new(vk_bytes) — must parse  │
+   │     └─► store {bytes, num_public_inputs}   (once only) │
+   │                                                        │
+   │   verify(proof, public_inputs: Vec<BytesN<32>>) -> bool│
+   │     │                                                  │
+   │     ├─► check proof.len() == 14,592                    │
+   │     ├─► check public_inputs.len() == num_public_inputs │
+   │     ├─► flatten Vec<BytesN<32>> → Bytes                │
+   │     ├─► UltraHonkVerifier.verify(proof, pi_bytes)      │
+   │     │     ├─► reconstruct Fiat-Shamir transcript       │
+   │     │     ├─► Sumcheck relations                       │
+   │     │     ├─► Shplemini (Gemini + Shplonk) opening     │
+   │     │     └─► KZG pairing check via BN254 host fns    │
+   │     └─► emit `honk/verified` event + return bool       │
+   │                                                        │
+   └────────────────────────────────────────────────────────┘
+
+   Verifier crate: yugocabrio/ultrahonk-rust-verifier
+   Pinned rev:     661db07200f890b1bd9a7349ed787c70a706dd12
+   Compiled WASM:  26 KiB (20% of Soroban's 128 KiB budget)
+```
+
+The 5 deployed instances differ only in embedded VK:
+
+| Instance | Circuit | Public inputs | Purpose |
+|---|---|---|---|
+| `CAUHYBIQ…` | zava_8w | 18 | Credit tier Medium (8 weeks) |
+| `CBCUHXCT…` | zava_12w | 26 | Credit tier Low (12 weeks) |
+| `CA6ORCVS…` | zava_24w | 50 | Credit tier VeryLow (24 weeks) |
+| `CA5ACPEE…` | zava_shielded | 4 | Vault withdraw + transfer |
+| `CAFAC6VA…` | zava_partial_withdraw | 6 | Vault partial withdraw (with change) |
+
+### 4. Credit Verifier — routes credit-tier claims to the right honk
+
+- **File**: `contracts/verifier/src/lib.rs`
+- **Address**: `CATO3SP3…TI2B`
+- **Job**: the business-logic layer for the *classic* credit flow. Uses the savings contract as the historical ledger. Routes to 8w/12w/24w honk verifier based on the caller's `consistency_weeks`.
+
+```
+   ┌──────────────── CREDIT VERIFIER (classic) ────────────────┐
+   │                                                           │
+   │   verify_proof(wallet, proof, PublicInputs{               │
+   │                min_weekly_amount, consistency_weeks,      │
+   │                commitments[], nullifiers[]})              │
+   │     │                                                     │
+   │     ├─► wallet.require_auth()                             │
+   │     ├─► tier = weeks_to_tier(consistency_weeks)           │
+   │     │     8→Medium,  12→Low,  24→VeryLow, else reject     │
+   │     ├─► foreach c: Savings.is_commitment_recorded(c)      │
+   │     ├─► foreach n: Savings.is_nullifier_spent(n)          │
+   │     ├─► honk_id = route_by_tier(tier)                     │
+   │     ├─► HonkVerifier[honk_id].verify(proof, pi)  ✓        │
+   │     ├─► write CreditRecord{wallet, tier, verified_at,     │
+   │     │                     expires_at = now + 90 days}     │
+   │     └─► emit `credit/verified` event                      │
+   │                                                           │
+   └───────────────────────────────────────────────────────────┘
+```
+
+### 5. Zava Credit — the bulletproof, vault-backed credit issuer
+
+- **File**: `contracts/zava_credit/src/lib.rs`
+- **Address**: `CB6E3NOD…TF44`
+- **Job**: same idea as Credit Verifier but reads from the **vault** (real deposits) instead of the savings contract, and computes an actual **loan cap** using the tier multiplier. This is the flow the frontend `/dashboard/credit` uses.
+
+```
+   ┌────────────────── ZAVA CREDIT ───────────────────┐
+   │                                                  │
+   │   initialize(vault, honk_verifier)               │
+   │                                                  │
+   │   claim_credit(wallet, proof, CreditClaim{       │
+   │           savings_range, commitments,            │
+   │           nullifiers, weeks})                    │
+   │     │                                            │
+   │     ├─► wallet.require_auth()                    │
+   │     ├─► reject duplicate nullifiers within claim │
+   │     ├─► weekly_lower_bound = range → stroops     │
+   │     ├─► pi = [lb, n, commits.., nulls..]         │
+   │     ├─► HonkVerifier.verify(proof, pi)  ✓        │
+   │     │                                            │
+   │     ├─► foreach: Vault.commitment_exists(c)      │
+   │     ├─► foreach: Vault.commitment_matches_       │
+   │     │            nullifier(c, n)                 │
+   │     │     └─► proves ownership: only someone     │
+   │     │        who knew the secret at deposit      │
+   │     │        time can produce a matching binding │
+   │     ├─► if Vault.is_nullifier_spent(n):          │
+   │     │       withdrawn_weeks += 1                 │
+   │     │   else:                                    │
+   │     │       active_weeks += 1                    │
+   │     │                                            │
+   │     ├─► tier = weeks_to_tier(active_weeks)       │
+   │     │       reject if active_weeks < 8           │
+   │     │                                            │
+   │     ├─► loan = active_weeks                      │
+   │     │        × weekly_lower_bound                │
+   │     │        × tier_multiplier / 100             │
+   │     │                                            │
+   │     └─► write CreditRecord{wallet, tier,         │
+   │              loan_eligible_stroops, active,      │
+   │              withdrawn, verified_at, expires_at} │
+   │                                                  │
+   └──────────────────────────────────────────────────┘
+```
+
+---
+
+## The Scoring System — Exact Formula
+
+### Step 1: pick a savings range
+
+Each range fixes the **weekly minimum** the borrower is claiming they've saved. The borrower commits to this number BEFORE generating a proof — cheating by claiming a higher range than they can prove would just make the proof fail.
+
+| Range | Weekly minimum (XLM) | Weekly minimum (USD, $0.10/XLM) |
+|---|---|---|
+| `R5`   | 50 XLM   | ~$5   |
+| `R20`  | 200 XLM  | ~$20  |
+| `R50`  | 500 XLM  | ~$50  |
+| `R200` | 2 000 XLM | ~$200 |
+| `R500` | 5 000 XLM | ~$500 |
+
+### Step 2: prove N weeks of savings
+
+The ZK circuit proves the borrower deposited **at least** `range.weekly_minimum` for `N` consecutive weeks. `N` becomes `active_weeks` after the vault check filters out any already-withdrawn commitments.
+
+### Step 3: map active weeks to tier
+
+```
+                Threshold        Tier
+                ─────────        ────
+                active < 8       ✗ rejected
+                8 ≤ active < 12  Medium
+               12 ≤ active < 24  Low
+               24 ≤ active       VeryLow
+
+               constants in zava_credit/src/lib.rs:
+                 MEDIUM_THRESHOLD   = 8
+                 LOW_THRESHOLD      = 12
+                 VERY_LOW_THRESHOLD = 24
+```
+
+### Step 4: compute loan eligibility
+
+```
+   loan_eligible_stroops =
+       active_weeks
+     × weekly_lower_bound_stroops
+     × tier_multiplier_bps
+     ÷ 100
+
+   tier_multiplier_bps:
+     Medium  → 200  (2.0×)   short history, smaller loans
+     Low     → 400  (4.0×)   established, moderate loans
+     VeryLow → 600  (6.0×)   long track record, largest loans
+```
+
+### Worked examples
+
+Assume `$0.10/XLM` for the USD column.
+
+| active_weeks | range | weekly_bound (XLM) | tier | multiplier | loan (XLM) | loan (USD) |
+|---:|:---:|---:|:---:|---:|---:|---:|
+| 8  | R5   | 50    | Medium  | 2.0× | 800    | ~$80    |
+| 8  | R20  | 200   | Medium  | 2.0× | 3 200  | ~$320   |
+| 12 | R20  | 200   | Low     | 4.0× | 9 600  | ~$960   |
+| 12 | R50  | 500   | Low     | 4.0× | 24 000 | ~$2 400 |
+| 24 | R20  | 200   | VeryLow | 6.0× | 28 800 | ~$2 880 |
+| 24 | R200 | 2 000 | VeryLow | 6.0× | 288 000| ~$28 800|
+| 24 | R500 | 5 000 | VeryLow | 6.0× | 720 000| ~$72 000|
+
+### Why this formula was chosen
+
+- **Linear in `active_weeks`** — every additional week of proven discipline adds real capacity. No cliff.
+- **Multiplied by weekly floor**, not by claimed amount — the borrower's actual deposit history stays hidden. Only the floor is public.
+- **Tier multiplier increases with tenure** — 6× at 24 weeks vs 2× at 8 weeks reflects the risk delta of a 6-month vs 2-month track record.
+- **Withdrawn weeks are counted but don't inflate the tier** — a borrower who withdrew half their savings gets credit for the withdrawn history (they proved discipline once) but the loan cap is set from what's currently locked.
+
+### What the lender sees vs what stays private
+
+```
+   LENDER sees:                          LENDER does NOT see:
+     ▪ wallet address                      ▪ actual amounts per week
+     ▪ tier (Medium/Low/VeryLow)           ▪ total balance saved
+     ▪ active_weeks count                  ▪ withdrawn amounts
+     ▪ withdrawn_weeks count               ▪ individual commitments
+     ▪ loan_eligible_stroops               ▪ the secret
+     ▪ verified_at / expires_at            ▪ vault deposit timing
+     ▪ savings_range key (R5..R500)        ▪ ANY info per-tx below the
+                                             range threshold
+```
+
+---
+
+## The Circuits — What Each One Actually Proves
+
+All circuits use Pedersen hashes for commitments/nullifiers, are compiled with Noir 1.0.0-beta.9, proved with Barretenberg 0.87.0, and use keccak Fiat-Shamir transcripts. Each produces a 14 592-byte proof and a 1 760-byte VK.
+
+### zava_8w / zava_12w / zava_24w — credit tier circuits
+
+The three tier circuits are structurally identical, differing only in the `N` constant (8, 12, 24).
+
+```
+   ┌──────── zava_Nw ────────┐
+   │                         │
+   │   PRIVATE WITNESS       │
+   │   ─────────────────     │
+   │     secret : Field      │
+   │     weekly_amounts[N]   │
+   │     deposit_ts[N]       │
+   │     week_numbers[N]     │
+   │                         │
+   │   PUBLIC INPUTS         │
+   │   ─────────────────     │
+   │     min_weekly_amount   │
+   │     consistency_weeks   │
+   │     commitments[N]      │
+   │     nullifiers[N]       │
+   │                         │
+   │   ASSERTIONS            │
+   │   ─────────────────     │
+   │   1. consistency_weeks == N                                     │
+   │   2. ∀i: pedersen(secret, amounts[i]) == commitments[i]         │
+   │   3. ∀i: pedersen(secret, week_numbers[i]) == nullifiers[i]     │
+   │   4. ∀i: amounts[i] ≥ min_weekly_amount                         │
+   │   5. ∀i>0: week_numbers[i] > week_numbers[i-1]                  │
+   │   6. ∀i>0: 0 < deposit_ts[i] - deposit_ts[i-1] ≤ 8 days         │
+   │                         │
+   └─────────────────────────┘
+
+   Public input count = 2 + 2N:
+     8w  → 18 (2 + 16)
+     12w → 26 (2 + 24)
+     24w → 50 (2 + 48)
+```
+
+### zava_shielded — vault withdraw + transfer
+
+```
+   ┌──── zava_shielded ────┐
+   │                       │
+   │   PRIVATE             │
+   │     secret            │
+   │     amount            │
+   │     merkle_path[20]   │
+   │     merkle_indices[20]│
+   │                       │
+   │   PUBLIC (4 inputs)   │
+   │     root              │
+   │     nullifier         │
+   │     recipient_hash    │
+   │     amount_out        │
+   │                       │
+   │   ASSERTIONS          │
+   │   1. commitment = pedersen(secret, amount)                     │
+   │   2. merkle_root(commitment, path, indices) == root            │
+   │   3. nullifier == pedersen(secret, 0)                          │
+   │   4. recipient_hash == 0    OR   amount_out == amount          │
+   │      (recipient_hash=0 signals "in-pool transfer",             │
+   │       any other value binds the proof to a specific recipient) │
+   │                       │
+   └───────────────────────┘
+```
+
+### zava_partial_withdraw — split into "sent" + "change"
+
+```
+   ┌──── zava_partial_withdraw ────┐
+   │                               │
+   │   PRIVATE                     │
+   │     secret                    │
+   │     input_amount              │
+   │     week                      │
+   │     merkle_path[20]           │
+   │     merkle_indices[20]        │
+   │     change_secret             │
+   │                               │
+   │   PUBLIC (6 inputs)           │
+   │     in_commitment             │
+   │     in_root                   │
+   │     in_nullifier              │
+   │     recipient_hash            │
+   │     withdraw_amount           │
+   │     change_commitment         │
+   │                               │
+   │   ASSERTIONS                  │
+   │   1. in_commitment == pedersen(secret, input_amount)           │
+   │   2. in_nullifier == pedersen(secret, week)                    │
+   │   3. merkle_root(in_commitment, path, indices) == in_root      │
+   │   4. 0 < withdraw_amount ≤ input_amount                        │
+   │   5. change_amount = input_amount - withdraw_amount            │
+   │   6. change_commitment == pedersen(change_secret, change_amount)│
+   │                               │
+   └───────────────────────────────┘
+```
+
+---
+
+## End-to-End Data Flows
+
+### Flow A: user deposits into the vault
+
+```
+   User's browser                             Chain (Vault XLM)
+   ──────────────                             ─────────────────
+
+   1. Generate random nonce
+   2. amount = user picks              ┐
+   3. commitment = H(nonce, amount)    │
+   4. nullifier  = H(nonce, week)      │
+   5. encrypted_note = AES(nonce+amt,  │
+                            scan_key)  │
+                                       ▼
+                       vault.deposit(commitment, nullifier, amount, note)
+                                       │
+                                       ├─► transfer XLM from user
+                                       ├─► CommitmentNullifierHash[c] = sha256(c||n)
+                                       ├─► Merkle insert commitment @ index i
+                                       ├─► NextLeafIndex++
+                                       ├─► Roots ring buffer update
+                                       └─► emit deposit(i, commitment, note)
+```
+
+### Flow B: user claims credit
+
+```
+   User's browser                                Chain
+   ──────────────                                ─────
+
+   1. Scan vault events → own deposits
+   2. Pick 8 (or 12 or 24) qualifying deposits
+      based on savings_range
+   3. Send inputs to Web Worker:
+      { secret, amounts[], timestamps[],
+        week_numbers[], min_weekly_amount,
+        consistency_weeks, commitments[],
+        nullifiers[] }
+   4. Worker calls noir.execute() → witness
+   5. Worker calls bb.generateProof(witness,
+      { keccak: true }) → 14,592-byte proof
+   6. Serialize proof + public inputs
+                                       │
+                                       ▼
+                       zava_credit.claim_credit(wallet, proof, claim)
+                                       │
+                                       ├─► wallet.require_auth()
+                                       ├─► weekly_lb = range → stroops
+                                       ├─► foreach commit:
+                                       │     vault.commitment_exists(c) ← real deposit?
+                                       │     vault.commitment_matches_nullifier(c,n)
+                                       │       (proves knowledge of the pair)
+                                       ├─► count active vs withdrawn
+                                       ├─► honk_verifier.verify(proof, pi)
+                                       │     └─► real Sumcheck + Shplemini
+                                       ├─► tier = weeks_to_tier(active)
+                                       ├─► loan = active × weekly_lb × mult / 100
+                                       └─► store CreditRecord{ wallet → record }
+
+   Lender's browser                             Chain
+   ────────────────                             ─────
+                       zava_credit.get_credit_record(wallet)
+                                       │
+                                       ▼
+                       {tier, loan_stroops, active_weeks,
+                        withdrawn_weeks, verified_at, expires_at}
+```
+
+### Flow C: user partial-withdraws (with change)
+
+```
+   User's browser                                Chain (Vault)
+   ──────────────                                ─────────────
+
+   1. Pick a deposit to partial-spend
+   2. change_secret = H(secret ||
+                        "zava_change_v1" ||
+                        in_commitment ||
+                        in_nullifier)   ← deterministic
+   3. change_amount = deposit - withdraw
+   4. change_commitment = H(change_secret,
+                            change_amount)
+   5. Encrypt {change_secret, change_amount,
+               asset} to scan_key
+   6. Prove via zava_partial_withdraw
+                                       │
+                                       ▼
+                       vault.partial_withdraw(proof, ..., encrypted_change_note)
+                                       │
+                                       ├─► PartialVerifier.verify(proof, 6 pi) ✓
+                                       ├─► mark old nullifier spent
+                                       ├─► Merkle-insert change_commitment
+                                       ├─► transfer withdraw_amount to recipient
+                                       └─► emit partial(nullifier, change_commitment,
+                                                        index, amount, encrypted_note)
+
+   Recovery: if the user wipes localStorage, their wallet can
+   re-scan `partial` events, decrypt each encrypted_change_note,
+   and reconstruct the change UTXO's secret + amount.
+```
+
+---
+
+## What Stays Private, What Doesn't — The Full Table
+
+| Fact on chain                                      | Public? | Private? | How? |
+|---|:---:|:---:|---|
+| A commitment was recorded                          | ✅ | | Merkle leaf visible |
+| Which wallet made a deposit                        | ✅ | | `require_auth` in tx |
+| Deposit amount (in `vault.deposit`)                | ✅ | | i128 in tx call data |
+| The `secret` behind a commitment                   | | ✅ | Never leaves the browser |
+| Which commitment maps to which deposit             | | ✅ | Hidden by hashing |
+| Amount per commitment used in a credit proof       | | ✅ | Private witness in circuit |
+| Whether a specific week's amount ≥ range threshold | ✅ | | Circuit publishes "yes" via VK check |
+| Actual amounts per week                            | | ✅ | Private witness |
+| Total balance across all deposits                  | | ✅ | Requires enumerating commitments + amounts |
+| Tier + loan cap                                    | ✅ | | Written to `CreditRecord` |
+| Change UTXO amount                                 | | ✅ | Encrypted in `partial` event |
+| Nullifier ↔ commitment link                        | | ✅ | Bound via sha256 hash; requires knowing both |
+
+---
+
+
 
 1. [What Zava does (the one-paragraph version)](#what-zava-does)
 2. [The mental model](#the-mental-model)
