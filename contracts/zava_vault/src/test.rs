@@ -55,7 +55,9 @@ fn setup() -> Harness<'static> {
 
     let vault_id = env.register_contract(None, ZavaVault);
     let vault = ZavaVaultClient::new(&env, &vault_id);
-    vault.initialize(&admin, &token_id, &verifier_id);
+    // Reuse the same stub verifier address for both slots — tests don't
+    // exercise the crypto path.
+    vault.initialize(&admin, &token_id, &verifier_id, &verifier_id);
 
     Harness {
         env,
@@ -117,7 +119,7 @@ fn initialize_sets_initial_state() {
 #[test]
 fn cannot_initialize_twice() {
     let h = setup();
-    let result = h.vault.try_initialize(&h.admin, &h.token_id, &h.token_id);
+    let result = h.vault.try_initialize(&h.admin, &h.token_id, &h.token_id, &h.token_id);
     assert_eq!(result, Err(Ok(VaultError::AlreadyInitialized)));
 }
 

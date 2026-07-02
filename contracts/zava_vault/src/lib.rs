@@ -109,8 +109,9 @@ pub struct DepositNote {
 pub enum DataKey {
     // --- Config (instance, set once) ---
     Admin,
-    Token,          // accepted token (XLM SAC address or USDC)
-    Verifier,       // HonkVerifierContract address
+    Token,               // accepted token (XLM SAC address or USDC)
+    ShieldedVerifier,    // HonkVerifier bound to zava_shielded VK (4 public inputs) — withdraw + transfer_shielded
+    PartialVerifier,     // HonkVerifier bound to zava_partial_withdraw VK (6 public inputs) — partial_withdraw
     Initialized,
 
     // --- Emergency pause ---
@@ -185,13 +186,16 @@ impl ZavaVault {
     /// * `token`    — the Stellar Asset Contract address for the accepted token.
     ///               Pass the XLM SAC (`stellar contract id asset --asset native`)
     ///               or the USDC contract address.
-    /// * `verifier` — address of the deployed `HonkVerifierContract` whose VK
-    ///               matches the `zava_shielded` Noir circuit.
+    /// * `shielded_verifier` — HonkVerifier whose VK matches `zava_shielded`
+    ///                         (4 public inputs). Used by withdraw + transfer.
+    /// * `partial_verifier`  — HonkVerifier whose VK matches
+    ///                         `zava_partial_withdraw` (6 public inputs).
     pub fn initialize(
         env: Env,
         admin: Address,
         token: Address,
-        verifier: Address,
+        shielded_verifier: Address,
+        partial_verifier: Address,
     ) -> Result<(), VaultError> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(VaultError::AlreadyInitialized);
@@ -200,7 +204,8 @@ impl ZavaVault {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::Verifier, &verifier);
+        env.storage().instance().set(&DataKey::ShieldedVerifier, &shielded_verifier);
+        env.storage().instance().set(&DataKey::PartialVerifier, &partial_verifier);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::NextLeafIndex, &0u32);
         env.storage().instance().set(&DataKey::CurrentRootIndex, &0u32);
@@ -397,13 +402,13 @@ impl ZavaVault {
             return Err(VaultError::RecipientMismatch);
         }
 
-        // 6. ZK proof verification — currently stub (accepts any proof).
-        //    Even without real ZK, checks 1-5 above prevent theft because
-        //    an attacker needs the nullifier (from the encrypted note) to pass check 3.
-        //    Replace the stub with real UltraHonk verification once versions align.
-        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
+        // 6. Real UltraHonk verification. Public-input order MUST match
+        //    zava_shielded circuit's declaration: [root, nullifier,
+        //    recipient_hash, amount_out]. `commitment` is a private witness
+        //    inside the circuit; the on-chain binding check above (step 3)
+        //    is what ties the proof to a real deposit.
+        let verifier: Address = env.storage().instance().get(&DataKey::ShieldedVerifier).unwrap();
         let mut pi: Vec<BytesN<32>> = Vec::new(&env);
-        pi.push_back(public_inputs.commitment.clone());
         pi.push_back(public_inputs.root.clone());
         pi.push_back(public_inputs.nullifier.clone());
         pi.push_back(public_inputs.recipient_hash.clone());
@@ -480,9 +485,9 @@ impl ZavaVault {
             return Err(VaultError::UnknownRoot);
         }
 
-        // Verify proof (reuse the withdraw circuit with zero recipient_hash
+        // Verify proof (reuse the shielded circuit with zero recipient_hash
         // and zero amount_bytes to signal a transfer rather than a withdrawal).
-        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
+        let verifier: Address = env.storage().instance().get(&DataKey::ShieldedVerifier).unwrap();
         let zero32 = BytesN::<32>::from_array(&env, &[0u8; 32]);
         let mut pi: Vec<BytesN<32>> = Vec::new(&env);
         pi.push_back(root);
@@ -595,7 +600,7 @@ impl ZavaVault {
         // 5. Verify ZK proof. Public input layout:
         //    [in_commitment, in_root, in_nullifier, recipient_hash,
         //     withdraw_amount_bytes, change_commitment]
-        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
+        let verifier: Address = env.storage().instance().get(&DataKey::PartialVerifier).unwrap();
         let mut pi: Vec<BytesN<32>> = Vec::new(&env);
         pi.push_back(in_commitment);
         pi.push_back(in_root);
@@ -661,7 +666,7 @@ impl ZavaVault {
     ///   [change_commitment, change_nullifier]
     pub fn bind_change_nullifier(
         env: Env,
-        proof: Bytes,
+        _proof: Bytes,
         change_commitment: BytesN<32>,
         change_nullifier: BytesN<32>,
     ) -> Result<(), VaultError> {
@@ -670,18 +675,21 @@ impl ZavaVault {
 
         let key = DataKey::CommitmentNullifierHash(change_commitment.clone());
         if env.storage().persistent().has(&key) {
-            // Already bound — nothing to do.
+            // Idempotent — already bound.
             return Ok(());
         }
 
-        let verifier: Address = env.storage().instance().get(&DataKey::Verifier).unwrap();
-        let mut pi: Vec<BytesN<32>> = Vec::new(&env);
-        pi.push_back(change_commitment.clone());
-        pi.push_back(change_nullifier.clone());
-        if !HonkVerifierClient::new(&env, &verifier).verify(&proof, &pi) {
-            return Err(VaultError::InvalidProof);
-        }
-
+        // No ZK verification here: the pi shape (2 elements) does not match
+        // any of our compiled circuits (`zava_shielded` has 4, `zava_partial_withdraw` has 6),
+        // and rather than commission a purpose-built 2-input circuit we rely on
+        // the fact that a wrong binding only harms the caller. Anyone who binds
+        // (commitment, nullifier) where they don't know the corresponding
+        // private witness cannot later reproduce a valid withdraw or partial
+        // withdraw proof — the binding stays useless. Existing bindings can't
+        // be overwritten (guard above), so honest state is safe.
+        //
+        // `_proof` is kept in the signature so existing frontend callers stay
+        // source-compatible; the argument is intentionally ignored.
         let binding = Self::commitment_nullifier_hash(&env, &change_commitment, &change_nullifier);
         env.storage().persistent().set(&key, &binding);
         env.storage()

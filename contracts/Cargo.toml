@@ -9,7 +9,10 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0" }
+# Protocol 26 "Yardstick" (mainnet 2026-05-06) shipped native BN254 host
+# functions (CAP-74 / CAP-80) and Poseidon2 (CAP-75) — the primitives that
+# make on-chain UltraHonk verification actually cheap. Do not downgrade.
+soroban-sdk = { version = "26.0.1" }
 
 [profile.release]
 opt-level = "z"

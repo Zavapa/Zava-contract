@@ -7,10 +7,18 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = { workspace = true }
+# `alloc` is required by ultrahonk_soroban_verifier for its arkworks-driven
+# field/curve arithmetic. Keeps the WASM within Soroban's 128 KiB contract
+# limit while permitting dynamic buffers during verification.
+soroban-sdk = { workspace = true, features = ["alloc"] }
+# Real UltraHonk verifier — Rust port of Aztec's Barretenberg reference,
+# tuned for Soroban and able to route BN254 ops through Protocol 26 host
+# precompiles. Pinned to an exact rev so the on-chain WASM matches the
+# audited commit — do not swap for a floating branch ref.
+ultrahonk_soroban_verifier = { git = "https://github.com/yugocabrio/ultrahonk-rust-verifier.git", rev = "661db07200f890b1bd9a7349ed787c70a706dd12", default-features = false }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils", "alloc"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

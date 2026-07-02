@@ -6,25 +6,25 @@
 //!
 //! 1. The prover knows a `secret` such that `commitment = pedersen_hash([secret, amount])`
 //!    is a leaf in the Merkle tree at `root`  (proves pool membership).
-//! 2. `nullifier == pedersen_hash([secret, 0])` — unique per commitment,
+//! 2. `nullifier == pedersen_hash([secret, 0])` - unique per commitment,
 //!    preventing double-spend.
-//! 3. `recipient_hash == pedersen_hash([recipient_bytes])` — binds the proof
+//! 3. `recipient_hash == pedersen_hash([recipient_bytes])` - binds the proof
 //!    to a specific destination address so a relay cannot redirect the payout.
 //!    Set to [0;32] for a private in-pool transfer (no token output).
-//! 4. `amount_out == amount` — the contract releases exactly what was deposited.
+//! 4. `amount_out == amount` - the contract releases exactly what was deposited.
 //!    Set to 0 for a private in-pool transfer.
 //!
-//! ## Private inputs (the witness — never revealed)
-//! - `secret`                  — the depositor's random 32-byte secret.
-//! - `amount`                  — the deposit amount in stroops (u64).
-//! - `merkle_path`             — sibling hashes along the Merkle path.
-//! - `merkle_path_indices`     — 0 = left, 1 = right at each level.
+//! ## Private inputs (the witness - never revealed)
+//! - `secret`                  - the depositor's random 32-byte secret.
+//! - `amount`                  - the deposit amount in stroops (u64).
+//! - `merkle_path`             - sibling hashes along the Merkle path.
+//! - `merkle_path_indices`     - 0 = left, 1 = right at each level.
 //!
 //! ## Public inputs (committed to in the proof, verified on-chain)
-//! - `root`           — the Merkle root used during proof generation.
-//! - `nullifier`      — pedersen_hash([secret, 0]).
-//! - `recipient_hash` — pedersen_hash([recipient_address_bytes]) or [0;32].
-//! - `amount_out`     — amount released (must equal `amount`), or 0 for transfer.
+//! - `root`           - the Merkle root used during proof generation.
+//! - `nullifier`      - pedersen_hash([secret, 0]).
+//! - `recipient_hash` - pedersen_hash([recipient_address_bytes]) or [0;32].
+//! - `amount_out`     - amount released (must equal `amount`), or 0 for transfer.
 
 use std::hash::pedersen_hash;
 
@@ -48,13 +48,13 @@ fn merkle_root(
 }
 
 fn main(
-    // ── Private witness ──────────────────────────────────────────────────────
+    // -- Private witness ------------------------------------------------------
     secret: Field,
     amount: u64,
     merkle_path: [Field; LEVELS],
     merkle_path_indices: [bool; LEVELS],
 
-    // ── Public inputs ─────────────────────────────────────────────────────────
+    // -- Public inputs ---------------------------------------------------------
     root: pub Field,
     nullifier: pub Field,
     recipient_hash: pub Field,  // 0 for in-pool transfer
@@ -67,7 +67,7 @@ fn main(
     let computed_root = merkle_root(commitment, merkle_path, merkle_path_indices);
     assert(computed_root == root);
 
-    // 3. Nullifier is pedersen_hash([secret, 0]) — unique per commitment.
+    // 3. Nullifier is pedersen_hash([secret, 0]) - unique per commitment.
     let expected_nullifier = pedersen_hash([secret, 0]);
     assert(expected_nullifier == nullifier);
 
@@ -79,7 +79,7 @@ fn main(
         // Withdrawal: public amount_out must equal the private amount.
         assert(amount_out == amount);
         // recipient_hash must be non-zero (a relay cannot steal by setting it
-        // to zero — the contract rejects zero recipient_hash for withdrawals).
+        // to zero - the contract rejects zero recipient_hash for withdrawals).
         assert(recipient_hash != 0);
     }
 }
@@ -107,7 +107,7 @@ fn test_valid_withdrawal() {
         let _ = i;
     }
 
-    // recipient_hash — pedersen_hash of some recipient bytes (mock).
+    // recipient_hash - pedersen_hash of some recipient bytes (mock).
     let recipient_hash: Field = pedersen_hash([0xdeadbeef]);
     let amount_out: u64 = amount;
 
@@ -152,7 +152,7 @@ fn test_wrong_amount_fails() {
         let _ = i;
     }
 
-    // amount_out doesn't match private amount → should fail
+    // amount_out doesn't match private amount -> should fail
     main(secret, amount, path, indices, root, nullifier, 1, 200_000_000);
 }
 
@@ -172,7 +172,7 @@ fn test_wrong_nullifier_fails() {
         let _ = i;
     }
 
-    // Wrong nullifier → should fail
+    // Wrong nullifier -> should fail
     let bad_nullifier: Field = pedersen_hash([secret, 999]);
     main(secret, amount, path, indices, root, bad_nullifier, 0, 0);
 }

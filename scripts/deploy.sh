@@ -69,45 +69,42 @@ deploy_honk() {
     local vk_file="${2:-}"
     local public_input_count=$((2 + 2 * tier_weeks))
 
+    if [ -z "$vk_file" ] || [ ! -f "$vk_file" ]; then
+        # Fatal — the real verifier rejects placeholder VKs at initialize,
+        # so silently continuing would waste an on-chain deploy.
+        echo "error: VK file not found for ${tier_weeks}w tier at $vk_file" >&2
+        echo "hint: run ./scripts/build.sh first (needs bb 0.87.0 + nargo 1.0.0-beta.9)" >&2
+        exit 1
+    fi
+
     local honk_id
     honk_id=$(deploy "$WASM_DIR/honk_verifier.wasm")
 
-    if [ -n "$vk_file" ] && [ -f "$vk_file" ]; then
-        local vk_hex
-        vk_hex=$(xxd -p -c 99999 "$vk_file")
-        stellar contract invoke \
-            --id "$honk_id" \
-            --source "$SOURCE" \
-            --network "$NETWORK" \
-            -- initialize \
-            --vk_bytes "$vk_hex" \
-            --num_public_inputs "$public_input_count" >/dev/null
-    else
-        echo "  WARNING: no VK file for ${tier_weeks}w tier — initialising with placeholder"
-        local placeholder_hex
-        placeholder_hex=$(printf 'AB%.0s' {1..64})
-        stellar contract invoke \
-            --id "$honk_id" \
-            --source "$SOURCE" \
-            --network "$NETWORK" \
-            -- initialize \
-            --vk_bytes "$placeholder_hex" \
-            --num_public_inputs "$public_input_count" >/dev/null
-    fi
+    local vk_hex
+    vk_hex=$(xxd -p -c 99999 "$vk_file")
+    # Log to stderr so command substitution captures only the contract ID.
+    echo "  → initializing $honk_id with $vk_file ($(stat -c '%s' "$vk_file") B)" >&2
+    stellar contract invoke \
+        --id "$honk_id" \
+        --source "$SOURCE" \
+        --network "$NETWORK" \
+        -- initialize \
+        --vk_bytes "$vk_hex" \
+        --num_public_inputs "$public_input_count" >/dev/null
 
     echo "$honk_id"
 }
 
 step "Deploying Honk verifier (8w tier)"
-HONK_8W=$(deploy_honk 8 "circuits/zava_8w/target/vk/vk")
+HONK_8W=$(deploy_honk 8 "circuits/zava_8w/target/vk")
 echo "  HONK_8W=$HONK_8W"
 
 step "Deploying Honk verifier (12w tier)"
-HONK_12W=$(deploy_honk 12 "circuits/zava_12w/target/vk/vk")
+HONK_12W=$(deploy_honk 12 "circuits/zava_12w/target/vk")
 echo "  HONK_12W=$HONK_12W"
 
 step "Deploying Honk verifier (24w tier)"
-HONK_24W=$(deploy_honk 24 "circuits/zava_24w/target/vk/vk")
+HONK_24W=$(deploy_honk 24 "circuits/zava_24w/target/vk")
 echo "  HONK_24W=$HONK_24W"
 
 # ---------- credit verifier ------------------------------------------------

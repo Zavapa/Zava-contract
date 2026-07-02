@@ -1,4 +1,4 @@
-//! Zava — 12-week savings discipline proof (Low-risk tier).
+//! Zava - 12-week savings discipline proof (Low-risk tier).
 //!
 //! See `zava_8w` for the design rationale. This is the same circuit with
 //! N = 12 so it produces a different verification key and a different

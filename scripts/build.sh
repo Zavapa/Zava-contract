@@ -30,18 +30,31 @@ for tier in zava_8w zava_12w zava_24w; do
 done
 
 # ---------- Verification keys (UltraHonk via barretenberg) -----------------
+#
+# Flags MUST match the on-chain verifier (ultrahonk_soroban_verifier):
+#   --scheme ultra_honk    : the proof scheme we verify
+#   --oracle_hash keccak   : Fiat-Shamir transcript hash the verifier expects
+#   --output_format bytes_and_fields : produces both target/vk (bytes) and
+#                                      target/vk_fields.json for debugging
+#
+# `bb` versioning is strict: proof/VK byte layouts drift between majors.
+# The reference verifier is tuned for bb v0.87.0 (Noir 1.0.0-beta.9). Any
+# other version has a good chance of producing a VK the contract rejects
+# at deploy time or a proof it rejects at verify time. See UPGRADE.md.
 
 if command -v bb >/dev/null 2>&1; then
     for tier in zava_8w zava_12w zava_24w; do
         step "Writing VK: $tier"
         bb write_vk \
-            -b "circuits/$tier/target/$tier.json" \
-            -o "circuits/$tier/target/vk" \
-            --verifier_target noir-recursive 2>&1 | tail -3
+            --scheme ultra_honk \
+            --oracle_hash keccak \
+            --bytecode_path "circuits/$tier/target/$tier.json" \
+            --output_path "circuits/$tier/target" \
+            --output_format bytes_and_fields 2>&1 | tail -3
     done
 else
     echo "WARNING: 'bb' not in PATH — skipping VK extraction." >&2
-    echo "Install with:  curl -sL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash" >&2
+    echo "Install with:  curl -sL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash && bbup -v 0.87.0" >&2
 fi
 
 # ---------- Soroban contracts ---------------------------------------------

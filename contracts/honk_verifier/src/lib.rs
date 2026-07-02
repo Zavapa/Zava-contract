@@ -10,15 +10,16 @@
 //! is immutable thereafter (no setter, no admin, no upgrade path). If the
 //! Noir circuit changes, a new instance of this contract must be deployed.
 //!
-//! The actual proof-verification check is currently a structural stub — see
-//! [`Self::verify_proof_inner`] for the integration boundary. Replace the
-//! body with a real UltraHonk verifier once the on-chain primitives needed
-//! to support it are available.
+//! Verification runs through the `ultrahonk_soroban_verifier` crate — a
+//! Rust port of Aztec's Barretenberg reference — which is compatible with
+//! `bb prove` / `bb write_vk` output and can route BN254 pairings through
+//! Protocol 26 host precompiles.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, Bytes, BytesN, Env, Vec,
 };
+use ultrahonk_soroban_verifier::{UltraHonkVerifier, VkLoadError, PROOF_BYTES};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -26,15 +27,15 @@ use soroban_sdk::{
 
 /// Serialised UltraHonk verification key as produced by `bb write_vk`.
 ///
-/// Stored as raw bytes so this contract does not need to know the field
-/// element layout used by the Noir backend — the verification implementation
-/// is responsible for deserialising on use.
+/// Stored as raw bytes; the verifier crate is responsible for parsing the
+/// field-element layout on use.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct VerificationKey {
     pub bytes: Bytes,
     /// Number of public inputs the Noir circuit was compiled with.
-    /// Used to reject proofs whose public-input vector does not match.
+    /// Kept as a fast structural gate; the verifier also enforces this
+    /// against the count embedded in the VK header.
     pub num_public_inputs: u32,
 }
 
@@ -60,19 +61,18 @@ pub enum HonkVerifierError {
     NotInitialized = 2,
     PublicInputCountMismatch = 3,
     InvalidProofLength = 4,
+    /// VK byte slice does not match the expected exact length.
+    VkInvalidLength = 5,
+    /// VK header contains out-of-range structural parameters.
+    VkInvalidParameters = 6,
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum byte length for a plausible UltraHonk proof. Real proofs from
-/// `bb prove` are ~4-15 KB depending on circuit size; this is a sanity
-/// floor that rejects obvious junk without being a definitive bound.
-const MIN_PROOF_BYTES: u32 = 192;
-
 /// TTL extension applied to persistent storage entries on touch.
-/// 1 month worth of ledgers at ~5s per ledger.
+/// ~30 days at 5s per ledger.
 const PERSISTENT_TTL_LEDGERS: u32 = 518_400;
 
 // ---------------------------------------------------------------------------
@@ -90,10 +90,8 @@ impl HonkVerifierContract {
 
     /// Embed the UltraHonk verification key. Callable exactly once.
     ///
-    /// # Arguments
-    /// * `vk_bytes`          — serialised verification key from `bb write_vk`.
-    /// * `num_public_inputs` — number of public inputs the matching Noir
-    ///                         circuit was compiled with.
+    /// The VK is parsed synchronously so that a malformed key is rejected at
+    /// deployment time rather than at first proof submission.
     pub fn initialize(
         env: Env,
         vk_bytes: Bytes,
@@ -102,6 +100,10 @@ impl HonkVerifierContract {
         if env.storage().instance().has(&DataKey::Vk) {
             return Err(HonkVerifierError::AlreadyInitialized);
         }
+        UltraHonkVerifier::new(&env, &vk_bytes).map_err(|e| match e {
+            VkLoadError::WrongLength => HonkVerifierError::VkInvalidLength,
+            VkLoadError::InvalidParameters => HonkVerifierError::VkInvalidParameters,
+        })?;
         env.storage().instance().set(
             &DataKey::Vk,
             &VerificationKey {
@@ -120,33 +122,51 @@ impl HonkVerifierContract {
     ///
     /// Returns `true` only if all of the following hold:
     /// 1. The contract has been initialised with a verification key.
-    /// 2. `public_inputs.len()` matches the VK's expected count.
-    /// 3. `proof` is at least [`MIN_PROOF_BYTES`] long.
-    /// 4. The inner verification (currently stubbed) succeeds.
+    /// 2. `proof.len() == PROOF_BYTES` (exact `bb prove` output size).
+    /// 3. `public_inputs.len()` matches the count declared at initialize.
+    /// 4. The cryptographic verification (Sumcheck + Shplemini) succeeds.
     ///
-    /// Returns `false` for any structural problem so that callers (which all
-    /// branch on the `bool` already) get a clean rejection instead of an
-    /// abort. This matters because different upstream operations submit
-    /// different public-input counts against a single shared verifier.
+    /// Returns `false` for any structural or cryptographic failure so that
+    /// upstream callers (which all branch on the `bool`) get a clean
+    /// rejection instead of an abort.
     pub fn verify(env: Env, proof: Bytes, public_inputs: Vec<BytesN<32>>) -> bool {
         let vk: VerificationKey = match env.storage().instance().get(&DataKey::Vk) {
             Some(v) => v,
             None => return false,
         };
 
+        // Cheap structural gates before the expensive crypto path.
+        if proof.len() as usize != PROOF_BYTES {
+            return false;
+        }
+        if public_inputs.len() != vk.num_public_inputs {
+            return false;
+        }
+
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_TTL_LEDGERS / 2, PERSISTENT_TTL_LEDGERS);
 
-        // While the inner verifier is stubbed we accept any non-empty proof
-        // and public-input vector. Length checks are advisory — see
-        // verify_proof_inner for the integration boundary.
-        if proof.is_empty() || public_inputs.is_empty() {
-            return false;
+        // Verifier expects `public_inputs` as raw 32-byte-aligned concat.
+        let mut public_inputs_bytes = Bytes::new(&env);
+        for pi in public_inputs.iter() {
+            let arr: [u8; 32] = pi.into();
+            public_inputs_bytes.extend_from_array(&arr);
         }
 
-        let valid = Self::verify_proof_inner(&env, &vk.bytes, &proof, &public_inputs);
+        let verifier = match UltraHonkVerifier::new(&env, &vk.bytes) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let valid = verifier
+            .verify(&env, &proof, &public_inputs_bytes)
+            .is_ok();
 
+        // `Events::publish` is soft-deprecated in soroban-sdk 26 in favour of
+        // `#[contractevent]` types. Migrating this is a separate refactor —
+        // the current shape keeps the event schema stable for existing
+        // downstream indexers.
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("honk"), symbol_short!("verified")),
             valid,
@@ -156,8 +176,8 @@ impl HonkVerifierContract {
     }
 
     /// Returns the raw verification-key bytes embedded at deployment.
-    /// Returned as primitive `Bytes` so cross-contract callers don't need
-    /// to depend on this crate for the `VerificationKey` struct.
+    /// Returned as primitive `Bytes` so cross-contract callers don't need to
+    /// depend on this crate for the `VerificationKey` struct.
     pub fn get_verification_key(env: Env) -> Bytes {
         let vk: VerificationKey = match env.storage().instance().get(&DataKey::Vk) {
             Some(v) => v,
@@ -173,41 +193,6 @@ impl HonkVerifierContract {
             None => panic_with_error!(&env, HonkVerifierError::NotInitialized),
         };
         vk.num_public_inputs
-    }
-
-    // -----------------------------------------------------------------------
-    // Inner verification — integration boundary
-    // -----------------------------------------------------------------------
-
-    /// **STUB — replace with a real UltraHonk verifier.**
-    ///
-    /// The current body performs only a non-cryptographic sanity check
-    /// (vk + proof + public inputs all non-empty) so that downstream
-    /// contracts can be exercised end-to-end before the cryptographic
-    /// verifier is ported.
-    ///
-    /// Integration path:
-    ///   * UltraHonk verification needs polynomial-commitment opening,
-    ///     Fiat-Shamir transcript reconstruction, and pairing checks for
-    ///     the KZG batch check. Aztec's Solidity reference verifier is the
-    ///     canonical source.
-    ///   * Soroban's only on-chain pairing primitive (BLS12-381 via
-    ///     `env.crypto().bls12_381()`) lives in soroban-sdk 22+. Bump first.
-    ///   * Once those are available, port the Aztec verifier into this
-    ///     function. The VK + proof byte layouts come from `bb write_vk`
-    ///     and `bb prove` respectively.
-    ///
-    /// An alternative is the recursive-bridge pattern: prove the Honk
-    ///     verification inside a Groth16 circuit and verify that Groth16
-    ///     proof on-chain instead. Cheaper to verify, more expensive to
-    ///     prove.
-    fn verify_proof_inner(
-        _env: &Env,
-        vk_bytes: &Bytes,
-        proof: &Bytes,
-        public_inputs: &Vec<BytesN<32>>,
-    ) -> bool {
-        !vk_bytes.is_empty() && !proof.is_empty() && !public_inputs.is_empty()
     }
 }
 

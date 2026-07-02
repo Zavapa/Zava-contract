@@ -11,11 +11,11 @@ and the production readiness checklist for the Zava smart contract suite.
 
 | Contract | Address (testnet) | Purpose |
 |---|---|---|
-| `savings` | `CDOL25N3GMIND6EPPVP5SVIH5AGM62QTIUS6MRUCLLAFW2YVFMBR26D3` | Records savings commitments for credit scoring |
-| `honk_verifier` (8w) | `CAU6IAI4XRKVLODASHMKFFH6EWSZJPPZ26WPGX2MBENSJUXGRXOFGDWH` | UltraHonk proof verifier for 8-week credit tier |
-| `honk_verifier` (12w) | `CCYQMNYEXTAMF3T6OBYJYYQIDAXIU2EP62J67Q43GTI355KJMOGU4BLY` | UltraHonk proof verifier for 12-week credit tier |
-| `honk_verifier` (24w) | `CBJYORRKROKBKTC7BPS4BNMROT3Q76N3TWVZK5XAWMLGEV2TOSPZFJCM` | UltraHonk proof verifier for 24-week credit tier |
-| `verifier` (credit) | `CCFKN2CRUIXQUNGSX5ALV4ZI4X7NFC25Q5MEIUZY7SZMN4FDEOEXWEZP` | Business logic: issues credit tiers after valid ZK proof |
+| `savings` | `CAEWAADG5Y2VM42VERCYMZUCCJIENBQFQDNICMX6WEDBMIPOQVE5D6DA` | Records savings commitments for credit scoring |
+| `honk_verifier` (8w) | `CAUHYBIQ4AWHVVSCSKFX262JP2AKHWHVB2ADWAH2NNF52IILNBVEWYU6` | UltraHonk proof verifier for 8-week credit tier |
+| `honk_verifier` (12w) | `CBCUHXCTSGNRVPMNDSUCDDGPRDMIGIQWOT2O6ELYSYAHWUTM6LJ34WR6` | UltraHonk proof verifier for 12-week credit tier |
+| `honk_verifier` (24w) | `CA6ORCVSHMO4TDIAYFXT2YWGUXFJ4Z7LVX2CXQOMV2S2BEV3UMMMWGQH` | UltraHonk proof verifier for 24-week credit tier |
+| `verifier` (credit) | `CATO3SP3FPFR36KR4H67NOO7ETSZ5JP3OHQXZFIYKG6JSKBIYGE2TI2B` | Business logic: issues credit tiers after valid ZK proof |
 | `zava_vault` | `CCEP74ATJ4GFNMZ53Q27LIBL7QYS4YHW6B75I53STBVFBNF4J7KMALNT` | Shielded payment pool — holds real XLM/USDC |
 | `honk_verifier` (shielded) | `CBE7SVEGDWUFRYVEBPYF3GHEBPZKJPEZWDXIF342CKWQTQ5UYDJN4WX3` | UltraHonk proof verifier for vault withdrawals |
 

@@ -8,20 +8,20 @@
 //!     `change_commitment` owned by `change_secret` (kept private).
 //!
 //! ## Private witness (never revealed)
-//! - `secret`         — the original commitment owner's secret nonce.
-//! - `input_amount`   — the amount the original deposit was for.
-//! - `week`           — the week number used in the input nullifier.
-//! - `merkle_path`    — siblings on the Merkle path to `in_root`.
-//! - `merkle_indices` — left/right at each level.
-//! - `change_secret`  — fresh nonce binding ownership of the change UTXO.
+//! - `secret`         - the original commitment owner's secret nonce.
+//! - `input_amount`   - the amount the original deposit was for.
+//! - `week`           - the week number used in the input nullifier.
+//! - `merkle_path`    - siblings on the Merkle path to `in_root`.
+//! - `merkle_indices` - left/right at each level.
+//! - `change_secret`  - fresh nonce binding ownership of the change UTXO.
 //!
 //! ## Public inputs (committed in the proof, checked by the contract)
-//! - `in_commitment`     — pedersen_hash([secret, input_amount]).
-//! - `in_root`           — recent Merkle root.
-//! - `in_nullifier`      — pedersen_hash([secret, week]).
-//! - `recipient_hash`    — sha-256(recipient address XDR); contract verifies.
-//! - `withdraw_amount`   — amount released to the recipient (in stroops).
-//! - `change_commitment` — pedersen_hash([change_secret, change_amount]).
+//! - `in_commitment`     - pedersen_hash([secret, input_amount]).
+//! - `in_root`           - recent Merkle root.
+//! - `in_nullifier`      - pedersen_hash([secret, week]).
+//! - `recipient_hash`    - sha-256(recipient address XDR); contract verifies.
+//! - `withdraw_amount`   - amount released to the recipient (in stroops).
+//! - `change_commitment` - pedersen_hash([change_secret, change_amount]).
 
 use std::hash::pedersen_hash;
 
@@ -45,7 +45,7 @@ fn merkle_root(
 }
 
 fn main(
-    // ── Private witness ─────────────────────────────────────────────────────
+    // -- Private witness -----------------------------------------------------
     secret: Field,
     input_amount: u64,
     week: u64,
@@ -53,7 +53,7 @@ fn main(
     merkle_indices: [bool; LEVELS],
     change_secret: Field,
 
-    // ── Public inputs ───────────────────────────────────────────────────────
+    // -- Public inputs -------------------------------------------------------
     in_commitment: pub Field,
     in_root: pub Field,
     in_nullifier: pub Field,

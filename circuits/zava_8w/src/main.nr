@@ -1,6 +1,6 @@
-//! Zava — 8-week savings discipline proof (Medium tier).
+//! Zava - 8-week savings discipline proof (Medium tier).
 //!
-//! Proves: "I made 8 deposits, each ≥ `min_weekly_amount`, with no gap
+//! Proves: "I made 8 deposits, each >= `min_weekly_amount`, with no gap
 //! exceeding 8 days between consecutive deposits, and I know the secret
 //! behind each on-chain commitment."
 //!
@@ -13,7 +13,7 @@ use std;
 // One per tier.
 global N: u32 = 8;
 
-// 8 days in seconds. Deposits must be ≤ 8 days apart and strictly increasing.
+// 8 days in seconds. Deposits must be <= 8 days apart and strictly increasing.
 global MAX_GAP_SECS: u64 = 691200;
 
 fn main(
@@ -29,7 +29,7 @@ fn main(
     commitments: pub [Field; N],
     nullifiers: pub [Field; N],
 ) {
-    // Bind this circuit to its tier — a 12-week or 24-week claim cannot
+    // Bind this circuit to its tier - a 12-week or 24-week claim cannot
     // route to the 8-week verifier even if the caller tries.
     assert(consistency_weeks == N);
 
@@ -55,7 +55,7 @@ fn main(
         // 4. Week numbers strictly increasing (no replay, no reordering).
         assert(week_numbers[i] > week_numbers[i - 1]);
 
-        // 5. Timestamp gap > 0 and ≤ 8 days.
+        // 5. Timestamp gap > 0 and <= 8 days.
         let gap = deposit_timestamps[i] - deposit_timestamps[i - 1];
         assert(gap > 0);
         assert(gap <= MAX_GAP_SECS);
