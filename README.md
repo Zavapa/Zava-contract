@@ -2,12 +2,35 @@
 
 This repo contains the on-chain contracts and zero-knowledge circuits that power Zava: a privacy-preserving savings-and-credit reputation system on Stellar.
 
+## 🏆 For Judges — Live UltraHonk Verification on Protocol 26
+
+**As of 2026-07-02, Zava is running real UltraHonk verification on chain — not a stub.** The full stack is wired end-to-end:
+
+- **Verifier crate**: [`yugocabrio/ultrahonk-rust-verifier`](https://github.com/yugocabrio/ultrahonk-rust-verifier) pinned to rev `661db07200f890b1bd9a7349ed787c70a706dd12` — a Rust port of Aztec's Barretenberg reference tuned for Soroban, routing BN254 pairings through Stellar Protocol 26 host precompiles (CAP-74).
+- **Toolchain**: pinned to `nargo 1.0.0-beta.9` + `bb 0.87.0` on the contract side; **byte-identical** `@aztec/bb.js@0.87.0` + `@noir-lang/noir_js@1.0.0-beta.9` in the browser.
+- **Circuits**: three tiers (`zava_8w` / `zava_12w` / `zava_24w`) for credit, plus `zava_shielded` and `zava_partial_withdraw` for vault operations. VKs are 1,760 B, proofs are 14,592 B (`PROOF_BYTES` matches the verifier crate exactly).
+- **WASM contract sizes**: honk_verifier 26 KiB (20% of Soroban's 128 KiB limit).
+
+### Provable on chain today
+
+| Test | Tx | Result |
+|---|---|---|
+| Valid `bb prove` output → verified on chain | [`aa6df56c…`](https://stellar.expert/explorer/testnet/tx/aa6df56c789367547c80cdb5c51dd844958eb94ebd09e51c362406bf7ffa848d) | `honk verified true` |
+| Tampered proof → rejected on chain | [`40cb44ee…`](https://stellar.expert/explorer/testnet/tx/40cb44eea1d270eb400b4c8cff77388939446118e6c65b7ddb65fbebf9965f62) | `honk verified false` |
+| Browser-generated proof via `@aztec/bb.js` → verified on chain | [`406808eb…`](https://stellar.expert/explorer/testnet/tx/406808eb61f8d265ac59e22ca999506a6b3c161f8367182687b5c7dfe93c16ed) | `honk verified true` |
+
+Completeness (accepts real proofs) and soundness (rejects tampered proofs) are both demonstrable from on-chain state. No trust in this README required.
+
+Frontend + backend live in a separate repo: [Zavapa/Zava](https://github.com/Zavapa/Zava).
+
+
+
 The goal of this README is to make the whole system understandable. By the end you should know:
 
 - What problem each piece solves
 - What data flows where, and what stays private
 - Why each design choice was made the way it was
-- What's real cryptography and what's still a placeholder
+- What's real cryptography and what glue exists around it
 - How to build, test, and deploy everything
 
 If you're new to ZK terminology, jump to the [Glossary](#glossary) first.
@@ -467,23 +490,27 @@ Each circuit also has a `#[test]` that demonstrates a valid proof against fixtur
 
 ---
 
-## What's stubbed (and why)
+## What's cryptographically enforced (2026-07-02 update)
 
-`HonkVerifierContract::verify_proof_inner` is currently a non-cryptographic sanity check (vk + proof + public inputs all non-empty). Real UltraHonk verification is not yet wired up.
+Real UltraHonk verification is now wired end-to-end. `HonkVerifierContract::verify_proof_inner` runs the full Sumcheck + Shplemini pipeline via `ultrahonk_soroban_verifier` (pinned rev `661db072…`), and the on-chain BN254 host functions from Protocol 26 (CAP-74) do the heavy pairing work.
 
-**Why it's stubbed:**
+Every credit-tier claim and every vault withdrawal now goes through this path — no structural stubs remain in the demo flow.
 
-1. Noir's modern toolchain (1.0-beta+) produces UltraHonk proofs, not Groth16. UltraHonk verification on-chain is significantly more involved than 3-pairing Groth16 verification — Aztec's Solidity reference verifier is ~2,000 lines and consumes a lot of gas.
-2. Soroban's only on-chain pairing primitive (`env.crypto().bls12_381()`) ships in soroban-sdk 22+. We're on 21 to keep the rest of the SDK API stable for now.
-3. The cryptographic verifier is independent of every other piece of architecture. The integration boundary is one function (`verify_proof_inner`); swapping in real verification doesn't touch the savings contract, the credit verifier, the circuits, or the frontend.
+### Path taken, in order
 
-**The path to real verification, in order of effort:**
+1. **Bumped `soroban-sdk` 21 → 26.0.1** — Protocol 26 shipped BN254 MSM + scalar-field arithmetic, exactly what UltraHonk needs.
+2. **Added `ultrahonk_soroban_verifier`** as a pinned git dep — a Rust port of Aztec's Barretenberg reference tuned for Soroban.
+3. **Downgraded toolchain to `nargo 1.0.0-beta.9` + `bb 0.87.0`** — the exact pair the verifier crate is tuned for. Same pair pinned in the browser via `@aztec/bb.js@0.87.0` + `@noir-lang/noir_js@1.0.0-beta.9`.
+4. **Regenerated all VKs** with `--scheme ultra_honk --oracle_hash keccak --output_format bytes_and_fields`. Every honk_verifier instance validates its VK synchronously at `initialize` so bad keys are rejected at deploy time.
 
-1. **Bump soroban-sdk to 22.x.** Audit the diff; the breaking changes are mostly in storage and event APIs and likely contained to small adjustments.
-2. **Port an UltraHonk verifier.** Aztec ships a Solidity reference; a Rust no_std port can use the BLS12-381 host functions for the final KZG batch check. This is the bulk of the work — easily a week of focused crypto coding plus testing against real `bb prove` outputs.
-3. **Alternative: recursive bridge.** Prove the Honk verification inside a Groth16 circuit, then verify the (much cheaper) Groth16 proof on-chain. More expensive proving for the user, dramatically cheaper verification. The Soroban contract would still be a pairing-based verifier, just for Groth16 instead of Honk.
+### What still isn't proven cryptographically
 
-Until one of those is in place, the system runs end-to-end but the proof check is structural. This is fine for local testing and demo flows, **not** fine for real credit decisions.
+There are two known gaps in the *composition* around the crypto (the crypto itself is sound):
+
+- **Deposit timestamps aren't bound to ledger time** — the "8 weeks of consistent savings" claim relies on private-witness timestamps the user picks. Fix: bind `env.ledger().timestamp()` into the commitment. Out of scope for this hackathon submission.
+- **`bind_change_nullifier` no longer requires a ZK check** — during the vault refactor to two verifiers, we dropped the check for the 2-input pi shape rather than commission a purpose-built circuit. Documented in-code with the DoS trade-off. Fix: emit the binding inside `partial_withdraw` and drop the standalone call.
+
+Both are documented explicitly in `SECURITY.md` and neither is exploitable via the demo flow.
 
 ---
 

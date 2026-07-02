@@ -553,6 +553,11 @@ impl ZavaVault {
         recipient_hash: BytesN<32>,
         withdraw_amount: i128,
         change_commitment: BytesN<32>,
+        // AES-GCM ciphertext of `{nonce, amountStroops, asset}` encrypted to
+        // the caller's scan key. Emitted in the partial event so a wallet
+        // that lost local state can recover the change UTXO's amount by
+        // scanning + decrypting — without a wallet's scan key this is opaque.
+        encrypted_change_note: Bytes,
     ) -> Result<u32, VaultError> {
         Self::check_initialized(&env)?;
         Self::check_not_paused(&env)?;
@@ -648,9 +653,12 @@ impl ZavaVault {
             &withdraw_amount,
         );
 
+        // Include `encrypted_change_note` so a wallet that lost local state
+        // can recover the change UTXO by scanning events and decrypting with
+        // its scan key. Callers that don't need recovery may pass empty bytes.
         env.events().publish(
             (symbol_short!("zava"), symbol_short!("partial")),
-            (in_nullifier, change_commitment, next_index, withdraw_amount),
+            (in_nullifier, change_commitment, next_index, withdraw_amount, encrypted_change_note),
         );
 
         Ok(next_index)
