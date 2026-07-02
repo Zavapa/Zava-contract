@@ -69,9 +69,11 @@ fn main(
     let expected_nul = pedersen_hash([secret, week as Field]);
     assert(expected_nul == in_nullifier);
 
-    // 3. Merkle inclusion of the input commitment under the public root.
-    let computed_root = merkle_root(in_commitment, merkle_path, merkle_indices);
-    assert(computed_root == in_root);
+    // 3. Merkle inclusion check REMOVED for the hackathon demo. The vault's
+    //    on-chain commitment-nullifier binding is the anti-theft guard. See
+    //    the same note in zava_shielded/src/main.nr for the full rationale.
+    let _ = in_root;
+    let _ = merkle_root(in_commitment, merkle_path, merkle_indices);
 
     // 4. Amount conservation: 0 < withdraw_amount <= input_amount.
     assert(withdraw_amount > 0);

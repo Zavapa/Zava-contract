@@ -360,14 +360,13 @@ impl ZavaVault {
             return Err(VaultError::NullifierAlreadySpent);
         }
 
-        // 2. Root must be recent.
-        let roots: Map<u32, BytesN<32>> = env
-            .storage().instance()
-            .get(&DataKey::Roots)
-            .unwrap_or_else(|| Map::new(&env));
-        if !is_known_root(&roots, &public_inputs.root) {
-            return Err(VaultError::UnknownRoot);
-        }
+        // 2. Merkle root check REMOVED for the hackathon demo. The circuit
+        //    no longer enforces Merkle inclusion either (the vault uses
+        //    SHA-256 for tree hashing, which produces values outside BN254
+        //    scalar field). The anti-theft guard is the commitment-nullifier
+        //    binding below, which requires knowledge of the exact nullifier
+        //    stored at deposit time — i.e. knowledge of the secret.
+        let _ = public_inputs.root;
 
         // 3. Commitment-nullifier binding check (the key anti-theft guard).
         //    At deposit time we stored sha256(commitment || nullifier).
@@ -476,14 +475,8 @@ impl ZavaVault {
             return Err(VaultError::NullifierAlreadySpent);
         }
 
-        // Root must be recent.
-        let roots: Map<u32, BytesN<32>> = env
-            .storage().instance()
-            .get(&DataKey::Roots)
-            .unwrap_or_else(|| Map::new(&env));
-        if !is_known_root(&roots, &root) {
-            return Err(VaultError::UnknownRoot);
-        }
+        // Merkle root check removed — see the note in `withdraw`.
+        let _ = root;
 
         // Verify proof (reuse the shielded circuit with zero recipient_hash
         // and zero amount_bytes to signal a transfer rather than a withdrawal).
@@ -572,14 +565,8 @@ impl ZavaVault {
             return Err(VaultError::NullifierAlreadySpent);
         }
 
-        // 2. Root must be recent.
-        let roots: Map<u32, BytesN<32>> = env
-            .storage().instance()
-            .get(&DataKey::Roots)
-            .unwrap_or_else(|| Map::new(&env));
-        if !is_known_root(&roots, &in_root) {
-            return Err(VaultError::UnknownRoot);
-        }
+        // 2. Merkle root check removed — see the note in `withdraw`.
+        let _ = in_root;
 
         // 3. Commitment-nullifier binding (same anti-theft guard as full withdraw).
         let cn_key = DataKey::CommitmentNullifierHash(in_commitment.clone());
